@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>正在启动…</title>
+<style>
+  :root {
+    --ink: #0b0b0c;
+    --ink-3: #616166;
+    --ink-4: #8e8e93;
+    --cinnabar: #b4392c;
+    --bg: #f2f2f5;
+    --rule: rgba(11, 11, 12, 0.10);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px;
+    background:
+      radial-gradient(520px 320px at 50% -20%, #ffffff, transparent 72%),
+      radial-gradient(360px 260px at 12% 112%, rgba(255, 255, 255, .8), transparent 70%),
+      var(--bg);
+    font-family: "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+    color: var(--ink);
+    user-select: none;
+    -webkit-app-region: drag;
+  }
+  .mark { color: var(--cinnabar); }
+  h1 {
+    margin: 0;
+    font-family: "Source Han Serif SC", "Noto Serif SC", "Songti SC", Georgia, serif;
+    font-size: 19px;
+    letter-spacing: 0.04em;
+  }
+  .sub { margin: 0; font-size: 12.5px; color: var(--ink-4); letter-spacing: 0.06em; }
+  .bar {
+    position: relative; width: 236px; height: 4px; margin-top: 4px;
+    border-radius: 999px; background: var(--rule); overflow: hidden;
+  }
+  .bar i {
+    position: absolute; top: 0; bottom: 0; left: -36%; width: 36%;
+    border-radius: 999px; background: var(--ink);
+    animation: slide 1.35s cubic-bezier(.5, .05, .5, .95) infinite;
+  }
+  @keyframes slide {
+    0% { left: -36%; }
+    100% { left: 100%; }
+  }
+  .tick { font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--ink-4); }
+  .tips {
+    position: absolute; bottom: 22px; left: 0; right: 0;
+    text-align: center; font-size: 11.5px; color: var(--ink-4);
+    padding: 0 24px; line-height: 1.7;
+  }
+</style>
+</head>
+<body>
+  <span class="mark" aria-hidden="true">
+    <svg viewBox="0 0 64 64" width="34" height="34" focusable="false">
+      <g stroke="currentColor" stroke-width="4" stroke-linecap="round" fill="none">
+        <path d="M32 10v44M12 21l40 22M52 21L12 43"/>
+      </g>
+      <circle cx="32" cy="32" r="6.5" fill="currentColor"/>
+    </svg>
+  </span>
+  <h1>SnowLuma × AstrBot 联合控制台</h1>
+  <p class="sub" id="phase">正在启动本地服务…</p>
+  <div class="bar" aria-hidden="true"><i></i></div>
+  <p class="tick" id="tick">0.0 秒</p>
+  <p class="tips" id="tip">第一次启动要解压、还要过一遍杀软，会慢一点；之后就快了。</p>
+
+  <script>
+    // 启动计时 + 提示轮播：让"等待"看起来是在干活，而不是卡死
+    (function () {
+      var started = Date.now();
+      var tick = document.getElementById('tick');
+      var phase = document.getElementById('phase');
+      var tip = document.getElementById('tip');
+      var tips = [
+        '第一次启动要解压、还要过一遍杀软，会慢一点；之后就快了。',
+        '装好后用右上角电源键「收起窗口」——服务继续跑，不用每次重开。',
+        '在「运行 → 面板登录」能直接看到两个面板的密码，不用翻日志。',
+        '机器人号请用小号；要是填成主号，注入时会被自动拦下来。'
+      ];
+      var phases = ['正在启动本地服务…', '正在检查端口与环境…', '正在准备界面…'];
+      var i = 0;
+      setInterval(function () {
+        tick.textContent = ((Date.now() - started) / 1000).toFixed(1) + ' 秒';
+      }, 100);
+      setInterval(function () {
+        i += 1;
+        tip.textContent = tips[i % tips.length];
+        phase.textContent = phases[Math.min(phases.length - 1, Math.floor(i / 2))];
+      }, 2400);
+    }());
+  </script>
+</body>
+</html>

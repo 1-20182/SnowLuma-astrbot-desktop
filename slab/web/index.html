@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:">
+
+<meta name="color-scheme" content="light dark">
+<title>SnowLuma × AstrBot 联合控制台</title>
+<meta name="description" content="Windows 图形化控制台：一键部署 SnowLuma（QQ 协议端）与 AstrBot（大模型机器人框架），零代码完成 QQ × 大模型联动。">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<script>
+/* 首帧防闪：解析期就把 data-theme 打上（localStorage → 系统偏好 → 浅色） */
+(function () {
+  var KEY = 'slab-theme';
+  var mode = null;
+  try { mode = localStorage.getItem(KEY); } catch (e) {}
+  if (mode !== 'light' && mode !== 'dark') {
+    mode = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', mode);
+  window.__slabTheme = {
+    current: function () { return document.documentElement.getAttribute('data-theme') || 'light'; },
+    set: function (m) {
+      document.documentElement.setAttribute('data-theme', m);
+      var btn = document.getElementById('btn-theme');
+      if (btn) btn.title = m === 'dark' ? '切换到浅色（Alt+D）' : '切换到深色（Alt+D）';
+      try { localStorage.setItem(KEY, m); } catch (e) {}
+    },
+    toggle: function () { this.set(this.current() === 'dark' ? 'light' : 'dark'); }
+  };
+  document.addEventListener('DOMContentLoaded', function () {
+    var btn = document.getElementById('btn-theme');
+    if (btn) {
+      btn.title = window.__slabTheme.current() === 'dark' ? '切换到浅色（Alt+D）' : '切换到深色（Alt+D）';
+      btn.addEventListener('click', function () { window.__slabTheme.toggle(); });
+    }
+    document.addEventListener('keydown', function (ev) {
+      if (ev.altKey && (ev.key === 'd' || ev.key === 'D')) {
+        ev.preventDefault();
+        window.__slabTheme.toggle();
+      }
+    });
+  });
+})();
+</script>
+<link rel="stylesheet" href="/assets/app.css?v={{V}}">
+<link rel="stylesheet" href="/assets/theme.css?v={{V}}">
+</head>
+<body>
+<!-- 液态玻璃的"折射源"：几块硬边光斑，玻璃压在上面才有透光感（参考 melodyflow 原型） -->
+<div class="ambient" aria-hidden="true"><i class="amb a"></i><i class="amb b"></i><i class="amb c"></i></div><a class="skip-link" href="#main">跳到主要内容</a>
+
+<!-- ───────────────────────────── 顶部常驻栏 ───────────────────────────── -->
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">
+      <svg viewBox="0 0 64 64" width="24" height="24" focusable="false">
+        <g stroke="currentColor" stroke-width="4" stroke-linecap="round" fill="none">
+          <path d="M32 10v44M12 21l40 22M52 21L12 43"/>
+        </g>
+        <circle cx="32" cy="32" r="6.5" fill="currentColor"/>
+      </svg>
+    </span>
+    <span class="brand-text">
+      <strong>SnowLuma × AstrBot</strong>
+      <small>联合控制台 · 无代码版</small>
+    </span>
+    <span class="ver" id="app-version" title="控制台版本">v—</span>
+  </div>
+
+  <div class="topbar-meta">
+    <span class="pill" id="sse-pill" data-state="connecting" title="实时通道（SSE）连接状态">
+      <i class="dot" aria-hidden="true"></i><span id="sse-text">正在连接…</span>
+    </span>
+    <span class="pill ghost" id="uptime-pill" title="控制台已运行时长">运行 —</span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn ghost sm" id="btn-lang" type="button" title="Switch to English">EN</button>
+    <button class="btn ghost sm" id="btn-theme" type="button" title="切换浅色/深色（Alt+D）">◐</button>
+    <button class="btn ghost sm" id="btn-help" type="button" title="打开帮助">帮助</button>
+    <button class="btn ghost sm" id="btn-term-dock" type="button" title="打开/关闭浮动终端（Alt+T）">终端</button>
+    <button class="btn sm" id="btn-restart-all" type="button">重启全部</button>
+    <button class="btn ghost sm" id="btn-quit" type="button" title="停止所有服务并关闭控制台进程">退出</button>
+  </div>
+
+  <!-- 桌面壳专用窗口控制（无边框窗口）：最小化 / 置顶 / 长按电源键 -->
+  <div class="win-controls" id="win-controls" hidden>
+    <button class="win-btn" id="win-min" type="button" title="最小化">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 8.5h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+    <button class="win-btn" id="win-max" type="button" title="最大化 / 还原">
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="3.2" y="3.2" width="9.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+    </button>
+    <button class="win-btn" id="win-pin" type="button" title="窗口置顶" aria-pressed="false">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/></svg>
+    </button>
+    <button class="win-power" id="win-power" type="button" title="按住 1 秒：收起或退出" aria-label="按住一秒收起或退出">
+      <span class="ring" aria-hidden="true"></span>
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <path d="M8 2.4v5.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        <path d="M4.4 4.6a4.9 4.9 0 1 0 7.2 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<div class="shell">
+  <!-- ───────────────────────────── 左侧步骤导航 ───────────────────────────── -->
+  <aside class="sidebar">
+    <nav class="steps" aria-label="步骤导航">
+      <button class="step" type="button" data-page="overview">
+        <span class="num">1</span>
+        <span class="label"><b>总览</b><small>状态灯 · 环境自检</small></span>
+      </button>
+      <button class="step" type="button" data-page="deploy">
+        <span class="num">2</span>
+        <span class="label"><b>部署</b><small>下载并安装两个项目</small></span>
+      </button>
+      <button class="step" type="button" data-page="config">
+        <span class="num">3</span>
+        <span class="label"><b>配置</b><small>QQ 号 · 大模型 Key</small></span>
+      </button>
+      <button class="step" type="button" data-page="run">
+        <span class="num">4</span>
+        <span class="label"><b>运行</b><small>启停服务 · 实时日志</small></span>
+      </button>
+      <button class="step" type="button" data-page="link">
+        <span class="num">5</span>
+        <span class="label"><b>联调</b><small>测试发消息 · 消息流水</small></span>
+      </button>
+      <button class="step" type="button" data-page="term">
+        <span class="num">6</span>
+        <span class="label"><b>终端</b><small>实时输出 · 进程监视</small></span>
+      </button>
+    </nav>
+
+    <div class="side-actions">
+      <button class="btn primary block" id="btn-start-all" type="button">一键启动全部</button>
+      <button class="btn block" id="btn-stop-all" type="button">停止全部</button>
+      <p class="hint">三个服务都跑起来后，去 QQ 里 <b>@机器人</b> 或发一条 <code>/你好</code>，就能收到大模型的回复。</p>
+    </div>
+  </aside>
+
+  <!-- ───────────────────────────── 主区域 ───────────────────────────── -->
+  <main id="main">
+
+    <!-- ============================ 1. 总览 ============================ -->
+    <section class="page" id="page-overview" hidden>
+      <div class="page-head">
+        <div>
+          <h1>总览</h1>
+          <p class="lede">一眼看清 SnowLuma、AstrBot、中继与 OneBot 连接的状态；有红色条目就看下面的「下一步建议」。</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn sm" id="btn-refresh-state" type="button">刷新状态</button>
+        </div>
+      </div>
+
+      <div class="status-grid" id="status-lights" aria-live="polite"></div>
+
+      <div class="grid two">
+        <section class="card">
+          <div class="card-head"><h2>端口占用</h2><span class="muted sm">四个端口必须互不相同且未被其它程序占用</span></div>
+          <table class="table" id="ports-table">
+            <thead><tr><th>用途</th><th>端口</th><th>状态</th><th>占用者</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>环境自检</h2><span class="muted sm">部署前先过一遍</span></div>
+          <ul class="checklist" id="env-list"></ul>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="card-head"><h2>下一步建议</h2><span class="muted sm">按顺序做即可，不需要懂代码</span></div>
+        <ol class="advice" id="advice-list"></ol>
+      </section>
+    </section>
+
+    <!-- ============================ 2. 部署 ============================ -->
+    <section class="page" id="page-deploy" hidden>
+      <div class="page-head">
+        <div>
+          <h1>部署</h1>
+          <p class="lede">第一次使用请先安装两个项目。安装包从官方仓库下载，全程可看日志；中途不要关闭本页面。</p>
+          <p class="muted sm">说明：所有下载/安装都在后台静默执行，<b>不会弹出任何命令行黑框</b>；进度与输出都显示在下方日志里。</p>
+        </div>
+        <div class="page-head-actions">
+          <a class="btn ghost sm" href="#term" title="实时看 git/uv/pip 的输出">在终端中看进度</a>
+          <button class="btn primary sm" id="dep-install-both" type="button">一键安装两个项目</button>
+        </div>
+      </div>
+
+      <section class="card" id="card-mirror">
+        <div class="card-head"><h2>下载源与测速</h2><span class="muted sm">国内直连慢就换个镜像，装之前先测一下</span></div>
+        <div class="field-row">
+          <label class="field">
+            <span>下载源 <code>app.download_mirror</code></span>
+            <select id="mirror-select">
+              <option value="auto">自动（测速挑最快的）</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>测速</span>
+            <div class="btn-row">
+              <button class="btn sm" id="mirror-test" type="button">测试各源速度</button>
+              <button class="btn ghost sm" id="mirror-open-github" type="button" title="用系统浏览器打开 GitHub Releases">打开 Releases</button>
+            </div>
+          </label>
+        </div>
+        <p class="hint" id="mirror-hint">测速会从每个源下载约 512 KB 样本（SnowLuma lite 包），大约 10 秒；只测速，不改任何文件。</p>
+        <div class="mirror-results" id="mirror-results"></div>
+      </section>
+      <div class="grid two">
+        <section class="card deploy-card" data-target="snowluma">
+          <div class="card-head">
+            <h2>SnowLuma <span class="tag">QQ 协议端</span></h2>
+            <span class="badge" id="dep-snowluma-badge">未安装</span>
+          </div>
+          <p class="muted">负责把 QQ 账号登录起来，并把消息转成标准的 OneBot v11 事件。</p>
+
+          <div class="field-row">
+            <label class="field">
+              <span>版本</span>
+              <select id="dep-snowluma-version" data-cfg="snowluma.version">
+                <option value="latest">latest（最新稳定版）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>安装类型</span>
+              <select id="dep-snowluma-edition" data-cfg="snowluma.edition">
+                <option value="full">full —— 自带 Node，推荐</option>
+                <option value="lite">lite —— 需系统 Node ≥ 24.22.1</option>
+              </select>
+            </label>
+          </div>
+          <label class="field">
+            <span>安装目录（留空 = 默认位置）</span>
+            <div class="path-row">
+              <input id="dep-snowluma-dir" type="text" spellcheck="false" placeholder="默认：程序目录\runtime\snowluma">
+              <button class="btn ghost sm" type="button" data-pick-dir="snowluma" data-pick-input="dep-snowluma-dir">选择…</button>
+              <button class="btn ghost sm" type="button" data-open-dir="snowluma">打开</button>
+            </div>
+          </label>          <p class="hint" id="dep-snowluma-edition-hint">full 版自带 node.exe，不用自己装 Node，小白首选；lite 版体积小，但要求本机已有 Node。</p>
+
+          <div class="btn-row">
+            <button class="btn primary" id="dep-snowluma-go" type="button">下载安装</button>
+            <button class="btn" id="dep-snowluma-copy" type="button">复制安装目录</button>
+            <button class="btn danger" id="dep-snowluma-remove" type="button">卸载</button>
+          </div>
+
+          <div class="progress" id="dep-snowluma-progress" hidden>
+            <div class="bar"><i style="width:0%"></i></div>
+            <span class="pct">0%</span>
+            <p class="step-text">准备中…</p>
+          </div>
+          <pre class="log-mini" id="dep-snowluma-log" aria-label="SnowLuma 安装日志"></pre>
+        </section>
+
+        <section class="card deploy-card" data-target="astrbot">
+          <div class="card-head">
+            <h2>AstrBot <span class="tag">大模型机器人框架</span></h2>
+            <span class="badge" id="dep-astrbot-badge">未安装</span>
+          </div>
+          <p class="muted">负责接住 QQ 消息、调用大模型生成回复（DeepSeek / OpenAI 兼容接口均可）。</p>
+
+          <div class="field-row">
+            <label class="field">
+              <span>版本 / 分支</span>
+              <select id="dep-astrbot-version" data-cfg="astrbot.version">
+                <option value="main">main（稳定主分支）</option>
+              </select>
+            </label>
+          </div>
+          <label class="field">
+            <span>安装目录（留空 = 默认位置）</span>
+            <div class="path-row">
+              <input id="dep-astrbot-dir" type="text" spellcheck="false" placeholder="默认：程序目录\runtime\astrbot">
+              <button class="btn ghost sm" type="button" data-pick-dir="astrbot" data-pick-input="dep-astrbot-dir">选择…</button>
+              <button class="btn ghost sm" type="button" data-open-dir="astrbot">打开</button>
+            </div>
+          </label>          <p class="hint">安装过程会 <code>git clone</code> 源码并创建独立的 Python 虚拟环境、安装依赖，通常需要 3–10 分钟。</p>
+
+          <div class="btn-row">
+            <button class="btn primary" id="dep-astrbot-go" type="button">克隆并安装依赖</button>
+            <button class="btn" id="dep-astrbot-copy" type="button">复制安装目录</button>
+            <button class="btn danger" id="dep-astrbot-remove" type="button">卸载</button>
+          </div>
+
+          <div class="progress" id="dep-astrbot-progress" hidden>
+            <div class="bar"><i style="width:0%"></i></div>
+            <span class="pct">0%</span>
+            <p class="step-text">准备中…</p>
+          </div>
+          <pre class="log-mini" id="dep-astrbot-log" aria-label="AstrBot 安装日志"></pre>
+        </section>
+      </div>
+
+      <section class="card" id="card-uninstall">
+        <div class="card-head"><h2>卸载与清理</h2><span class="muted sm">装错了、要换盘、或者想彻底清干净</span></div>
+        <div id="uninstall-list" class="uninstall-list"><p class="muted sm">正在读取占用…</p></div>
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn ghost sm" type="button" id="usage-refresh">刷新占用</button>
+          <button class="btn ghost sm" type="button" id="drop-backups">清空备份（data\backups）</button>
+          <span class="muted sm" id="usage-total"></span>
+        </div>
+        <p class="hint">「卸载」会把目录备份到 <code>data\backups</code>（可回滚）；「彻底删除」直接删掉安装目录和它的历史备份，不可恢复。</p>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>安装位置与运行环境</h2><span class="muted sm">路径可用环境变量 SLAB_RUNTIME 覆盖</span></div>
+        <table class="table" id="paths-table">
+          <thead><tr><th>项目</th><th>路径</th><th>状态</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </section>
+
+    <!-- ============================ 3. 配置 ============================ -->
+    <section class="page" id="page-config" hidden>
+      <div class="page-head">
+        <div>
+          <h1>配置</h1>
+          <p class="lede">只有三个必填项：<b>QQ 号</b>、<b>大模型 API Key</b>、<b>模型名</b>。其余保持默认即可。</p>
+        </div>
+        <div class="page-head-actions">
+          <span class="dirty-flag" id="cfg-dirty" hidden>有未保存的修改</span>
+          <button class="btn sm" id="cfg-reset" type="button">恢复默认</button>
+          <button class="btn primary sm" id="cfg-save" type="button">保存设置</button>
+        </div>
+      </div>
+
+      <form id="config-form" class="config-form" autocomplete="off" onsubmit="return false;">
+        <section class="card">
+          <div class="card-head"><h2>基础与端口</h2><span class="muted sm">只在本机使用，一般不用改</span></div>
+          <div class="field-grid">
+            <label class="field">
+              <span>控制台端口 <code>app.port</code></span>
+              <input id="cfg-app-port" data-cfg="app.port" type="number" min="1" max="65535" step="1" placeholder="8790">
+            </label>
+            <label class="field">
+              <span>AstrBot 面板端口 <code>astrbot.webui_port</code></span>
+              <input id="cfg-astrbot-port" data-cfg="astrbot.webui_port" type="number" min="1" max="65535" step="1" placeholder="6185">
+            </label>
+            <label class="field">
+              <span>SnowLuma 面板端口 <code>snowluma.webui_port</code></span>
+              <input id="cfg-snowluma-port" data-cfg="snowluma.webui_port" type="number" min="1" max="65535" step="1" placeholder="5099">
+            </label>
+            <label class="field">
+              <span>OneBot 联动端口 <code>link.ws_port</code></span>
+              <input id="cfg-link-port" data-cfg="link.ws_port" type="number" min="1" max="65535" step="1" placeholder="6199">
+            </label>
+          </div>
+          <label class="check"><input id="cfg-open-browser" data-cfg="app.open_browser" type="checkbox"> 启动控制台后自动打开浏览器</label>
+
+          <details class="advanced">
+            <summary>高级：监听地址</summary>
+            <div class="field-grid">
+              <label class="field">
+                <span>控制台监听地址 <code>app.host</code></span>
+                <input id="cfg-app-host" data-cfg="app.host" type="text" placeholder="127.0.0.1">
+              </label>
+              <label class="field">
+                <span>联动通道主机 <code>link.ws_host</code></span>
+                <input id="cfg-link-host" data-cfg="link.ws_host" type="text" placeholder="127.0.0.1">
+              </label>
+              <label class="field">
+                <span>AstrBot OneBot 监听地址 <code>astrbot.platform.ws_reverse_host</code></span>
+                <input id="cfg-ws-reverse-host" data-cfg="astrbot.platform.ws_reverse_host" type="text" placeholder="0.0.0.0">
+              </label>
+            </div>
+          </details>
+        </section>
+
+        <!-- 安装位置 / 数据目录 / 配置备份 —— 给别人用的时候最常改的东西 -->
+        <section class="card" id="card-paths">
+          <div class="card-head"><h2>安装位置与备份</h2><span class="muted sm">想装到 D 盘就改这里；留空用默认位置</span></div>
+          <div class="field-grid">
+            <label class="field">
+              <span>SnowLuma 安装目录 <code>snowluma.install_dir</code></span>
+              <div class="path-row">
+                <input id="cfg-snowluma-dir" data-cfg="snowluma.install_dir" type="text"
+                       placeholder="留空 = 程序目录\runtime\snowluma" spellcheck="false">
+                <button class="btn ghost sm" type="button" data-pick-dir="snowluma" title="打开系统目录选择框">选择…</button>
+                <button class="btn ghost sm" type="button" data-open-dir="snowluma" title="在资源管理器里打开">打开</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>AstrBot 安装目录 <code>astrbot.install_dir</code></span>
+              <div class="path-row">
+                <input id="cfg-astrbot-dir" data-cfg="astrbot.install_dir" type="text"
+                       placeholder="留空 = 程序目录\runtime\astrbot" spellcheck="false">
+                <button class="btn ghost sm" type="button" data-pick-dir="astrbot" title="打开系统目录选择框">选择…</button>
+                <button class="btn ghost sm" type="button" data-open-dir="astrbot" title="在资源管理器里打开">打开</button>
+              </div>
+            </label>
+          </div>
+          <div class="field">
+            <span>数据目录 <code>data/</code>（配置、日志、下载缓存）</span>
+            <div class="path-row">
+              <input id="cfg-data-dir" type="text" readonly title="数据目录跟随程序位置">
+              <button class="btn ghost sm" type="button" data-open-dir="data">打开</button>
+            </div>
+            <div class="field-note" id="storage-note">正在读取存储规划…</div>
+            <label class="field" style="margin-top:12px">
+              <span>QQ 注入模式 <code>snowluma.hook_mode</code></span>
+              <select id="cfg-hook-mode" data-cfg="snowluma.hook_mode">
+                <option value="manual">手动（只注入我选中的 QQ，推荐）</option>
+                <option value="auto">自动（注入所有检测到的 QQ）</option>
+              </select>
+            </label>
+            <div class="field-note">「自动」会把你日常使用的 QQ 也接管进来；只想跑机器人就用「手动」，到「运行 → 接入 QQ」里点「用这个」。</div>
+          </div>
+          <div class="btn-row">
+            <button class="btn ghost sm" type="button" id="cfg-export" title="导出成 JSON 文件">导出配置</button>
+            <button class="btn ghost sm" type="button" id="cfg-import-btn" title="从 JSON 文件恢复">导入配置</button>
+            <input id="cfg-import-file" type="file" accept="application/json,.json" hidden>
+            <span class="muted sm">导出的文件里含 API Key 与联动 Token，别乱发；导入会整份覆盖当前配置。</span>
+          </div>
+          <div class="field-note" id="cfg-io-note" hidden></div>
+        </section>
+
+        <section class="card" id="card-maint">
+          <div class="card-head"><h2>维护</h2><span class="muted sm">长期挂着跑时用得着</span></div>
+          <div class="field-grid">
+            <label class="field">
+              <span>日志保留天数 <code>app.log_retain_days</code></span>
+              <input id="cfg-log-days" data-cfg="app.log_retain_days" type="number" min="0" max="365" step="1" placeholder="7">
+            </label>
+            <label class="field">
+              <span>安装包保留天数 <code>app.download_retain_days</code></span>
+              <input id="cfg-download-days" data-cfg="app.download_retain_days" type="number" min="0" max="365" step="1" placeholder="7">
+            </label>
+          </div>
+          <div class="field-note">控制台每 6 小时自动清理一次；填 0 表示不自动删。单个日志超过 20 MB 会先截断再保留。</div>
+          <div class="btn-row">
+            <button class="btn ghost sm" type="button" id="maint-cleanup">立即清理</button>
+            <button class="btn ghost sm" type="button" id="maint-fix-ports">检查并自动换端口</button>
+            <button class="btn ghost sm" type="button" id="maint-orphans" title="上次被强杀时可能留下 AstrBot/SnowLuma 进程占着端口">清理残留进程</button>
+            <span class="muted sm" id="maint-note"></span>
+          </div>
+
+          <div class="upgrade-box" id="upgrade-box">
+            <div class="card-head" style="margin:16px 0 6px">
+              <h2 style="font-size:14px">升级控制台</h2>
+              <span class="muted sm" id="upgrade-current">当前版本 v—</span>
+            </div>
+            <div class="path-row">
+              <input id="upgrade-zip" type="text" spellcheck="false" placeholder="选择新版本 zip（不用解压，直接选压缩包）">
+              <button class="btn ghost sm" id="upgrade-pick" type="button">选择…</button>
+              <button class="btn sm" id="upgrade-check" type="button">检查</button>
+            </div>
+            <p class="muted sm" id="upgrade-info">升级只替换程序文件；配置、两个项目的安装、下载缓存都不会动。</p>
+            <div class="btn-row">
+              <button class="btn danger sm" id="upgrade-run" type="button" disabled>开始升级</button>
+              <span class="muted sm" id="upgrade-keep"></span>
+            </div>
+            <details class="qq-trouble">
+              <summary>升级会不会丢配置 / 装好的项目？（点开）</summary>
+              <ul>
+                <li>程序文件：被新版本覆盖，覆盖前自动备份到 <code>data\backups\program-v…</code></li>
+                <li>配置：不动；旧格式会自动迁移，迁移前留 <code>config.v…bak.json</code></li>
+                <li>SnowLuma / AstrBot 安装：不动，不用重装、不用重新扫码</li>
+                <li>覆盖时程序自动退出，完成后自动启动；覆盖失败会自动回滚到旧版本</li>
+              </ul>
+            </details>
+          </div>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>QQ 账号</h2><span class="muted sm">强烈建议使用小号，协议端有封号风险</span></div>
+          <div class="field-grid">
+            <label class="field">
+              <span>QQ 号 <code>snowluma.qq_uin</code></span>
+              <input id="cfg-qq-uin" data-cfg="snowluma.qq_uin" type="text" inputmode="numeric" placeholder="例如 123456789" autocomplete="off">
+              <span class="field-note">
+                <button class="btn ghost sm" id="cfg-sync-account" type="button">读取已登录账号</button>
+                <span id="cfg-sync-note"></span>
+              </span>
+            </label>
+            <label class="field">
+              <span>管理员 QQ <code>astrbot.admins_id</code></span>
+              <input id="cfg-admins" data-cfg="astrbot.admins_id" data-type="list" type="text" placeholder="留空 = 自动使用上面的 QQ 号" autocomplete="off">
+              <span class="field-note">填了你自己的 QQ 号即可使用 <code>/help</code>、<code>/reset</code> 等管理指令；多个号用逗号或空格分隔。</span>
+            </label>
+            <label class="field">
+              <span>AstrBot 面板用户名 <code>astrbot.webui_username</code></span>
+              <input id="cfg-webui-user" data-cfg="astrbot.webui_username" type="text" placeholder="astrbot" autocomplete="off">
+            </label>
+            <label class="field">
+              <span>AstrBot 面板密码 <code>astrbot.webui_password</code></span>
+              <input id="cfg-webui-pass" data-cfg="astrbot.webui_password" data-secret="1" type="password" placeholder="已保存，留空表示不修改" autocomplete="new-password">
+              <em class="secret-badge" data-secret-badge="astrbot_webui_password">未设置</em>
+            </label>
+          </div>
+          <div class="check-row">
+            <label class="check"><input id="cfg-snowluma-autostart" data-cfg="snowluma.autostart" type="checkbox"> 随控制台自动启动 SnowLuma</label>
+            <label class="check"><input id="cfg-astrbot-autostart" data-cfg="astrbot.autostart" type="checkbox"> 随控制台自动启动 AstrBot</label>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>大模型</h2><span class="muted sm">填 DeepSeek / OpenAI / 任何 OpenAI 兼容接口</span></div>
+          <div class="field-grid">
+            <label class="field">
+              <span>接口地址 Base URL <code>astrbot.provider.base_url</code></span>
+              <input id="cfg-base-url" data-cfg="astrbot.provider.base_url" type="text" placeholder="https://api.deepseek.com/v1">
+            </label>
+            <label class="field">
+              <span>模型 <code>astrbot.provider.model</code></span>
+              <input id="cfg-model" data-cfg="astrbot.provider.model" type="text" list="model-options"
+                     placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
+              <datalist id="model-options"></datalist>
+              <span class="field-note">
+                <button class="btn ghost sm" id="cfg-fetch-models" type="button">拉取可用模型</button>
+                <button class="btn ghost sm" id="cfg-import-provider" type="button" title="如果你直接改过 AstrBot 的模型配置">从 AstrBot 读回</button>
+                <span id="cfg-models-note">读取当前 Key 能用的模型，点一下从列表里挑，不用手敲。</span>
+              </span>
+            </label>
+            <label class="field wide">
+              <span>API Key <code>astrbot.provider.api_key</code></span>
+              <input id="cfg-api-key" data-cfg="astrbot.provider.api_key" data-secret="1" type="password" placeholder="已保存，留空表示不修改" autocomplete="new-password">
+              <em class="secret-badge" data-secret-badge="astrbot_api_key">未设置</em>
+              <span class="field-note">形如 <code>sk-…</code>；填写后点右上角「保存设置」。留空不会清空已保存的值。</span>
+            </label>
+            <label class="field wide">
+              <span>连通性检查</span>
+              <span class="field-note">
+                <button class="btn sm" id="cfg-test-provider" type="button">测试大模型连接</button>
+                <span id="cfg-test-note">点一下会用当前 Key 真发一次最小请求（只花 1 个 token）。</span>
+              </span>
+            </label>
+            <label class="field wide">
+              <span>机器人人设 <code>astrbot.behavior.persona</code></span>
+              <textarea id="cfg-persona" data-cfg="astrbot.behavior.persona" rows="3" placeholder="你是一个友好、简洁的中文聊天助手。"></textarea>
+            </label>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>联动模式</h2><span class="muted sm">二选一，不确定就用「原生直连」</span></div>
+          <div class="radio-cards" role="radiogroup" aria-label="联动模式">
+            <label class="radio-card">
+              <input type="radio" name="link-mode" data-cfg="link.mode" value="native">
+              <span class="rc-body">
+                <b>原生直连（推荐）</b>
+                <em>SnowLuma 直接连 AstrBot 的 OneBot 接口，少一个中间进程，最省资源、延迟最低。</em>
+                <small>适合：只接一个 QQ 号、只挂一个机器人。</small>
+              </span>
+            </label>
+            <label class="radio-card">
+              <input type="radio" name="link-mode" data-cfg="link.mode" value="bridge">
+              <span class="rc-body">
+                <b>内置中继</b>
+                <em>控制台自己当一个「中间人」：SnowLuma → 中继 → AstrBot，能看到每一句收发消息，方便排查。</em>
+                <small>适合：消息不回复、要抓包看数据流、以后接多个机器人。</small>
+              </span>
+            </label>
+          </div>
+
+          <div class="field-grid token-row">
+            <label class="field wide">
+              <span>联动 Token（两侧必须一致） <code>link.token</code></span>
+              <input id="cfg-token" data-cfg="link.token" data-secret="1" type="text" placeholder="已保存，留空表示不修改" autocomplete="off">
+              <span class="field-note">相当于 OneBot 的口令，防止别人连到你的机器人。改完记得去「联调」页点「写入联动配置」。</span>
+            </label>
+            <div class="btn-col">
+              <button class="btn sm" id="cfg-token-gen" type="button">重新生成</button>
+              <button class="btn sm" id="cfg-token-copy" type="button">复制</button>
+            </div>
+          </div>
+
+          <div class="field-grid relay-only" data-mode-only="bridge" hidden>
+            <label class="field">
+              <span>SnowLuma 中继端口 <code>snowluma.relay_port</code></span>
+              <input id="cfg-relay-port" data-cfg="snowluma.relay_port" type="number" min="1" max="65535" step="1" placeholder="3001">
+              <span class="field-note">仅「内置中继」模式使用：SnowLuma 会在此端口开一个 OneBot 服务端给中继连接，需与其它端口不同。</span>
+            </label>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>触发规则</h2><span class="muted sm">决定机器人什么时候开口</span></div>
+          <div class="radio-cards" role="radiogroup" aria-label="触发方式">
+            <label class="radio-card">
+              <input type="radio" name="trigger-mode" data-cfg="link.trigger_mode" value="at_or_prefix">
+              <span class="rc-body">
+                <b>群里 @机器人 或以 / 开头</b>
+                <em>只在被叫到时回复，最不打扰。群聊里 @机器人、或发「/你好」；私聊默认都会回复。</em>
+              </span>
+            </label>
+            <label class="radio-card">
+              <input type="radio" name="trigger-mode" data-cfg="link.trigger_mode" value="all">
+              <span class="rc-body">
+                <b>所有消息都回复</b>
+                <em>群里每句话都接，容易刷屏、也更容易被风控，仅在测试时使用。</em>
+              </span>
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>自定义前缀 <code>link.trigger_prefixes</code></span>
+              <input id="cfg-prefixes" data-cfg="link.trigger_prefixes" data-type="list" type="text" placeholder="/ , #">
+              <span class="field-note">多个前缀用逗号或空格分隔，例如 <code>/ , #</code></span>
+            </label>
+          </div>
+
+          <div class="check-row">
+            <label class="check"><input id="cfg-allow-private" data-cfg="link.allow_private" type="checkbox"> 允许私聊对话</label>
+            <label class="check"><input id="cfg-allow-group" data-cfg="link.allow_group" type="checkbox"> 允许群聊对话</label>
+            <label class="check"><input id="cfg-ignore-self" data-cfg="link.ignore_self" type="checkbox"> 忽略自己发的消息</label>
+            <label class="check"><input id="cfg-forward-non-text" data-cfg="link.forward_non_text" type="checkbox"> 图片/语音等非文本也转给大模型</label>
+          </div>
+        </section>
+
+        <div class="form-actions">
+          <button class="btn primary" id="cfg-save-bottom" type="button">保存设置</button>
+          <span class="muted sm" id="cfg-status">改动会立即写入 <code>data/config.json</code>，不需要重启控制台。</span>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============================ 4. 运行 ============================ -->
+    <section class="page" id="page-run" hidden>
+      <div class="page-head">
+        <div>
+          <h1>运行</h1>
+          <p class="lede">在这里启停服务、打开两个网页面板，并实时查看日志。启动顺序建议：AstrBot → SnowLuma → 中继。</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn sm" id="run-restart-all" type="button">重启全部</button>
+        </div>
+      </div>
+
+      <div class="service-grid" id="service-cards"></div>
+
+      <section class="card" id="card-login-qq">
+        <div class="card-head"><h2>接入 QQ（登录机器人账号）</h2><span class="muted sm">SnowLuma 不会弹二维码：扫码是在 QQ 客户端里扫</span></div>
+        <ol class="qq-steps">
+          <li><b>用机器人账号登录 QQ 客户端</b>：打开电脑版 QQ（NT 版），用要当机器人的号扫码登录；登录后<b>别退出、别切号</b>，让 QQ 留在后台运行。</li>
+          <li><b>启动 SnowLuma</b>：在上面卡片点「启动」。它会自动发现并注入 QQ 进程，日志会出现 <code>[Hook] login detected</code> → <code>[OneBot] session started</code>。</li>
+          <li><b>确认接入</b>：点「检查账号」，能列出 QQ 号就成功了；也可以打开 SnowLuma 面板看进程与连接状态。</li>
+          <li><b>保持在线</b>：关掉 QQ 客户端 = 机器人掉线；多开就多登一个 QQ，SnowLuma 会为每个账号各建一条连接。</li>
+        </ol>
+        <div class="btn-row">
+          <button class="btn sm" id="qq-open-panel" type="button">打开 SnowLuma 面板</button>
+          <button class="btn ghost sm" id="qq-check" type="button">检查账号</button>
+          <span class="muted sm" id="qq-check-result"></span>
+        </div>
+        <div class="qq-processes" id="qq-processes"><p class="muted sm">点下面的「刷新进程」读取本机正在运行的 QQ。</p></div>
+        <div class="btn-row">
+          <button class="btn ghost sm" id="qq-refresh" type="button">刷新进程</button>
+          <button class="btn ghost sm" id="qq-launch" type="button">隔离启动 QQ</button>
+          <select id="qq-install-select" title="选择要隔离启动的 QQ 安装"></select>
+          <span class="muted sm" id="qq-mode-hint"></span>
+        </div>
+        <details class="qq-trouble">
+          <summary>没检测到账号？常见原因（点开）</summary>
+          <ul>
+            <li><b>权限不一致</b>：QQ 用管理员运行，SnowLuma 也要管理员（反之亦然）；两者必须是同一个 Windows 用户。</li>
+            <li><b>QQ 版本太老</b>：需要 QQ NT 版（9.9 及以上），老版不支持注入。</li>
+            <li><b>杀软拦截</b>：把 SnowLuma 安装目录加入白名单，再重启 SnowLuma。</li>
+            <li><b>手动注入</b>：SnowLuma 面板 → 进程列表 → 对目标进程点「注入 / 加载」；还不行就重启 QQ 再试。</li>
+            <li><b>账号风控</b>：新号或异地登录容易触发验证，先在 QQ 里完成验证再启动。</li>
+            <li>完整说明见 <code>docs/MANUAL.md</code>「三、登录机器人 QQ」。</li>
+          </ul>
+        </details>
+      </section>
+
+      <section class="card" id="card-panels">
+        <div class="card-head"><h2>面板登录</h2><span class="muted sm">密码直接显示，不用再去翻终端日志</span></div>
+        <div class="panel-list" id="panel-list"><p class="muted sm">正在读取面板凭据…</p></div>
+      </section>
+
+      <section class="card log-panel">
+        <div class="card-head">
+          <h2>实时日志</h2>
+          <div class="log-tools">
+            <select id="log-service" title="选择服务">
+              <option value="">全部服务</option>
+            </select>
+            <select id="log-level" title="级别过滤">
+              <option value="all">全部级别</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+            <label class="check inline"><input id="log-autoscroll" type="checkbox" checked> 自动滚动</label>
+            <button class="btn sm" id="log-reload" type="button">重新加载</button>
+            <button class="btn sm" id="log-clear" type="button">清屏</button>
+          </div>
+        </div>
+        <pre class="log-view" id="log-view" aria-live="off" aria-label="服务日志输出"></pre>
+      </section>
+    </section>
+
+    <!-- ============================ 5. 联调 ============================ -->
+    <section class="page" id="page-link" hidden>
+      <div class="page-head">
+        <div>
+          <h1>联调</h1>
+          <p class="lede">把配置写进两个项目，再发一条测试消息验证链路：QQ ⇄ SnowLuma ⇄ OneBot ⇄ AstrBot ⇄ 大模型。</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn primary sm" id="link-apply" type="button">写入联动配置</button>
+          <button class="btn sm" id="link-selftest" type="button" title="SnowLuma 能收 + AstrBot 能发，真发一条消息给管理员">双向自检</button>
+          <button class="btn ghost sm" id="link-repair" type="button" title="能收到消息但机器人不回？点这里重建发送链路">修复发送链路</button>
+          <button class="btn sm" id="link-refresh" type="button">刷新</button>
+        </div>
+      </div>
+
+      <div class="link-grid" id="link-status-blocks"></div>
+
+      <div class="grid two">
+        <section class="card">
+          <div class="card-head"><h2>发一条测试消息</h2><span class="muted sm">让机器人主动发一条，最快验证链路</span></div>
+          <div class="field-row">
+            <label class="field">
+              <span>发送到</span>
+              <select id="link-target-type">
+                <option value="group">群聊</option>
+                <option value="private">私聊</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>群号 / QQ 号</span>
+              <input id="link-target-id" type="text" inputmode="numeric" placeholder="例如 123456789">
+            </label>
+          </div>
+          <label class="field">
+            <span>消息内容</span>
+            <input id="link-text" type="text" placeholder="你好，这是一条测试消息">
+          </label>
+          <div class="btn-row">
+            <button class="btn primary" id="link-send" type="button">发送测试消息</button>
+          </div>
+          <p class="hint">提示：私聊只能发给你自己或机器人好友；群聊需要机器人已经在群里。</p>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>我的 QQ 账号信息</h2><span class="muted sm">从 OneBot 读取当前登录账号</span></div>
+          <div class="btn-row">
+            <button class="btn" id="link-whoami" type="button">读取账号信息</button>
+          </div>
+          <dl class="kv" id="link-whoami-view">
+            <dt>状态</dt><dd>尚未读取</dd>
+          </dl>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>最近一次操作结果</h2>
+          <span class="muted sm">「写入联动配置」「测试消息」的后端返回详情</span>
+        </div>
+        <div class="link-result" id="link-result" aria-live="polite">
+          <div class="lr-line muted">还没有操作记录。</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>消息流水</h2>
+          <div class="log-tools">
+            <span class="muted sm" id="msg-count">0 条</span>
+            <button class="btn sm" id="msg-clear" type="button">清空</button>
+          </div>
+        </div>
+        <div class="msg-stream" id="msg-stream">
+          <p class="empty">还没有消息。去 QQ 里给机器人发一句话，这里会实时出现「收到 / 回复」。</p>
+        </div>
+      </section>
+    </section>
+
+    <!-- ============================ 6. 终端 ============================ -->
+    <section class="page" id="page-term" hidden>
+      <div class="page-head">
+        <div>
+          <h1>终端</h1>
+          <p class="lede">实时观看每一个进程的输出：部署时的 <code>git</code> / <code>uv</code> / <code>pip</code> 进度、SnowLuma 与 AstrBot 的运行日志，都会像终端一样滚出来。</p>
+          <p class="muted sm">下方是控制台进程树（含 PID / CPU / 内存），进程数随部署/服务启停实时变化。</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn sm" id="term-pause" type="button">暂停滚动</button>
+          <button class="btn ghost sm" id="term-clear" type="button">清屏</button>
+          <button class="btn ghost sm" id="term-download" type="button">下载日志</button>
+        </div>
+      </div>
+
+      <section class="card term-card">
+        <div class="card-head">
+          <h2>实时输出</h2>
+          <div class="term-tools">
+            <select id="term-filter" aria-label="按来源过滤">
+              <option value="">全部来源</option>
+              <option value="deploy">部署</option>
+              <option value="snowluma">SnowLuma</option>
+              <option value="astrbot">AstrBot</option>
+              <option value="bridge">中继</option>
+              <option value="console">控制台</option>
+            </select>
+            <label class="term-check"><input type="checkbox" id="term-autoscroll" checked> 自动滚动</label>
+            <span class="term-stat" id="term-stat">0 行</span>
+          </div>
+        </div>
+        <pre class="term-view" id="term-view" tabindex="0" aria-live="polite"><span class="term-placeholder">等待输出……（去「部署」页装东西，或到「运行」页启动服务）</span></pre>
+      </section>
+
+      <section class="card proc-card">
+        <div class="card-head">
+          <h2>进程</h2>
+          <span class="term-stat" id="proc-stat">—</span>
+        </div>
+        <div class="proc-table-wrap">
+          <table class="proc-table">
+            <thead>
+              <tr><th>服务</th><th>进程</th><th>PID</th><th>CPU</th><th>内存</th><th>运行</th></tr>
+            </thead>
+            <tbody id="proc-body">
+              <tr><td colspan="6" class="muted">正在读取进程树……</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <details class="proc-detail">
+          <summary>查看完整命令行</summary>
+          <pre id="proc-cmd">—</pre>
+        </details>
+      </section>
+    </section>
+
+  </main>
+</div>
+
+<!-- ───────────────────────────── Toast ───────────────────────────── -->
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<!-- ───────────────────────────── 帮助弹窗 ───────────────────────────── -->
+<dialog id="help-dialog" aria-labelledby="help-title">
+  <div class="dialog-head">
+    <h2 id="help-title">帮助 · 五分钟上手</h2>
+    <button class="btn ghost sm" id="help-close" type="button">关闭</button>
+  </div>
+  <div class="dialog-body">
+    <ol class="help-steps">
+      <li><b>部署</b>：在「部署」页点 <i>下载安装</i>（SnowLuma，建议 full 版）和 <i>克隆并安装依赖</i>（AstrBot）。</li>
+      <li><b>登录 QQ</b>：用**机器人小号**在电脑版 QQ（NT 版 9.9+）里扫码登录，登录后保持 QQ 在后台运行。<br>
+          SnowLuma 不会弹二维码——它通过注入 QQ 进程来接管会话，所以扫码动作在 QQ 客户端里完成。</li>
+      <li><b>配置</b>：填 QQ 号（建议小号）、大模型 API Key 与模型名，点「保存设置」。</li>
+      <li><b>写入联动</b>：「联调」页点「写入联动配置」，把端口与 Token 同步进两个项目。</li>
+      <li><b>启动</b>：「运行」页依序启动 AstrBot → SnowLuma；日志出现 <code>[Hook] login detected</code> 与 <code>[OneBot] session started</code> 即接入成功。</li>
+      <li><b>验证</b>：「运行」页点「检查账号」确认 QQ 号；然后在 QQ 里私聊机器人或群里 @它。</li>
+    </ol>
+    <h3>常见问题速查</h3>
+    <ul class="help-faq">
+      <li><b>面板打不开</b>：先确认「运行」页对应服务是绿灯，再看端口是否被占用。</li>
+      <li><b>QQ 未接入</b>：先在 QQ 客户端扫码登录（SnowLuma 不弹二维码），再点「运行 → 检查账号」；仍不行见 <code>docs/MANUAL.md</code> 第三节。</li>
+      <li><b>消息不回复</b>：检查 API Key、模型名，以及触发规则是否匹配（群里需要 @ 或前缀）。</li>
+      <li><b>多开 QQ</b>：SnowLuma 会给每个已登录账号各建一条 AstrBot 连接，只要有一条正常就算连通。</li>
+      <li><b>端口被占用</b>：在「配置」页换一个端口，然后重新「写入联动配置」。</li>
+      <li><b>杀软拦截 node.exe</b>：把安装目录加入白名单后重试部署。</li>
+    </ul>
+    <p class="muted sm">完整手册：<code>docs/MANUAL.md</code>（含「登录机器人 QQ」图文步骤）；其它：<code>README.md</code>、<code>docs/DEPLOY.md</code>、<code>docs/TROUBLESHOOTING.md</code>、<code>docs/ARCHITECTURE.md</code>。接口调试可访问 <a href="/api/docs" target="_blank" rel="noopener">/api/docs</a>。</p>
+  </div>
+</dialog>
+
+<dialog id="power-dialog" aria-labelledby="power-title">
+  <div class="dialog-head">
+    <h2 id="power-title">要收起还是退出？</h2>
+    <button class="btn ghost sm" id="power-cancel" type="button">继续使用</button>
+  </div>
+  <div class="dialog-body">
+    <p class="muted sm">长按电源键是"我要走了"的意思。机器人还在跑的时候，建议先「收起」，下次点任务栏图标就能接着用。</p>
+    <div class="power-choices">
+      <button class="power-choice" id="power-min" type="button">
+        <b>收起窗口</b>
+        <span class="muted sm">服务继续跑，QQ 机器人不掉线</span>
+      </button>
+      <button class="power-choice danger" id="power-quit" type="button">
+        <b>彻底退出</b>
+        <span class="muted sm">停止 SnowLuma / AstrBot 并结束进程</span>
+      </button>
+    </div>
+  </div>
+</dialog>
+
+<!-- ─────────────────────── 首次启动向导（wizard.js） ─────────────────────── -->
+<div id="wizard" class="wizard" role="dialog" aria-modal="true" aria-labelledby="wiz-title" hidden>
+  <div class="wizard-card card">
+    <header class="wizard-head">
+      <div>
+        <p class="wizard-eyebrow">首次使用引导</p>
+        <h2 id="wiz-title">四步把机器人跑起来</h2>
+      </div>
+      <button class="btn ghost sm" id="wiz-skip" type="button">跳过</button>
+    </header>
+
+    <ol class="wizard-steps">
+      <li class="wizard-step active" data-step="1"><i>1</i><span>环境检查</span></li>
+      <li class="wizard-step" data-step="2"><i>2</i><span>安装项目</span></li>
+      <li class="wizard-step" data-step="3"><i>3</i><span>填写配置</span></li>
+      <li class="wizard-step" data-step="4"><i>4</i><span>启动</span></li>
+    </ol>
+
+    <div class="wizard-body">
+      <section class="wiz-pane" data-pane="1">
+        <p class="muted sm">先确认这台机器具备运行条件；有黄色项也不一定挡路，向导会给出替代方案。</p>
+        <ul class="wiz-checks" id="wiz-checks"></ul>
+      </section>
+
+      <section class="wiz-pane" data-pane="2" hidden>
+        <div class="wiz-install-row">
+          <span>SnowLuma <small>QQ 协议端</small></span>
+          <span class="badge muted" id="wiz-snowluma-state">未安装</span>
+        </div>
+        <div class="wiz-install-row">
+          <span>AstrBot <small>大模型框架</small></span>
+          <span class="badge muted" id="wiz-astrbot-state">未安装</span>
+        </div>
+        <p class="muted sm" id="wiz-target" hidden></p>
+        <div class="wiz-progress"><div class="wiz-progress-bar" id="wiz-progress-bar"></div></div>
+        <div class="wiz-log" id="wiz-deploy-log" aria-live="polite"></div>
+        <div class="btn-row">
+          <button class="btn primary sm" id="wiz-install" type="button">开始安装</button>
+          <span class="muted sm">大约 3–10 分钟；过程中不会弹命令行黑框</span>
+        </div>
+      </section>
+
+      <section class="wiz-pane" data-pane="3" hidden>
+        <div class="field-grid">
+          <label class="field">
+            <span>机器人 QQ 号</span>
+            <input id="wiz-qq" type="text" inputmode="numeric" placeholder="例如 123456789">
+          </label>
+          <label class="field">
+            <span>管理员 QQ（可留空 = 同上）</span>
+            <input id="wiz-admin" type="text" placeholder="填自己的 QQ 号才能用 /help 等指令">
+          </label>
+        </div>
+        <div class="field-grid">
+          <label class="field">
+            <span>大模型 API Key</span>
+            <input id="wiz-api-key" type="password" placeholder="sk-...  （DeepSeek / OpenAI 兼容）">
+          </label>
+          <label class="field">
+            <span>模型名</span>
+            <input id="wiz-model" type="text" placeholder="deepseek-chat">
+          </label>
+        </div>
+        <label class="field">
+          <span>接口地址 Base URL</span>
+          <input id="wiz-base-url" type="text" placeholder="https://api.deepseek.com/v1">
+        </label>
+        <div class="wiz-ports-row">
+          <span class="muted sm">端口：</span>
+          <div class="wiz-ports" id="wiz-ports"></div>
+          <button class="btn ghost sm" id="wiz-fix-ports" type="button">检查并自动换端口</button>
+        </div>
+      </section>
+
+      <section class="wiz-pane" data-pane="4" hidden>
+        <p class="muted sm">点「开始使用」后会：把配置写进两个项目 → 启动 SnowLuma 与 AstrBot → 刷新页面。</p>
+        <div class="wiz-log" id="wiz-finish-log" aria-live="polite"></div>
+      </section>
+    </div>
+
+    <footer class="wizard-foot">
+      <button class="btn ghost sm" id="wiz-prev" type="button">上一步</button>
+      <div class="wiz-hint" id="wiz-hint"></div>
+      <button class="btn primary sm" id="wiz-next" type="button">下一步</button>
+    </footer>
+  </div>
+</div>
+<script src="/assets/i18n.js?v={{V}}" defer></script>
+<script src="/assets/i18n-extra.js?v={{V}}" defer></script>
+<script src="/assets/app.js?v={{V}}" defer></script>
+<script src="/assets/term.js?v={{V}}" defer></script>
+<script src="/assets/wizard.js?v={{V}}" defer></script>
+<script>
+  // 中 / EN 切换（i18n.js 提供 window.slabI18n）
+  (function () {
+    var btn = document.getElementById('btn-lang');
+    if (!btn || !window.slabI18n) return;
+    btn.addEventListener('click', function () { window.slabI18n.toggle(); });
+    window.slabI18n.onChange(function (lang) {
+      var en = lang === 'en-US';
+      btn.textContent = en ? '中' : 'EN';
+      btn.title = en ? '切换到中文' : 'Switch to English';
+    });
+  }());
+</script>
+<script>
+  // 退出：桌面壳里让外壳退出（外壳会杀掉整个后端进程树）；浏览器里走后端 shutdown 接口
+  document.getElementById('btn-quit')?.addEventListener('click', async () => {
+    if (!confirm('将停止 SnowLuma / AstrBot 并关闭控制台，确定吗？')) return;
+    const desktop = window.slabDesktop;
+    if (desktop && desktop.isDesktop) {
+      try { await desktop.quit(); } catch (err) { alert('退出失败：' + err); }
+      return;
+    }
+    try {
+      await fetch('/api/system/shutdown', { method: 'POST' });
+      const mask = document.createElement('div');
+      mask.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;' +
+        'justify-content:center;background:rgba(11,15,23,.94);color:#e6edf7;font-size:16px;' +
+        'text-align:center;padding:24px;';
+      mask.textContent = '控制台已退出，所有服务已停止，可以关闭此页面了。';
+      document.body.appendChild(mask);
+    } catch (err) {
+      alert('退出请求失败：' + err);
+    }
+  });
+</script>
+</body>
+</html>

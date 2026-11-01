@@ -1,0 +1,25 @@
+# 虚拟环境与依赖
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# 运行时数据（安装的两个项目、下载包、日志、配置（含密钥））
+data/
+runtime/
+
+# 临时文件
+*.log.tmp
+*.part
+.idea/
+.vscode/
+Thumbs.db
+
+# Electron 桌面壳
+desktop/node_modules/
+desktop/dist/
+desktop/package-lock.json
+build/
+dist/
+*.log
