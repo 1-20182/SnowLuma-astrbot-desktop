@@ -5,6 +5,9 @@
 > 所有的「安装目录」都在项目下的 `runtime/` 里：
 > `runtime/snowluma/`、`runtime/astrbot/`。
 > 想换位置？启动前设置环境变量 `SLAB_RUNTIME`（例如放到 D 盘）。
+>
+> **Linux 版**的完整差异（apt 依赖、Python/Node 门槛、setcap 与 ptrace、官方 Linux QQ、无头 VNC）见
+> [LINUX.md](LINUX.md)。本文里凡是 `\` 路径与 `python.exe`，在 Linux 上分别换成 `/` 与 `python3`。
 
 ---
 
@@ -12,14 +15,17 @@
 
 | 项 | 要求 | 怎么检查 |
 | --- | --- | --- |
-| 操作系统 | Windows 10 / 11（x64）。SnowLuma 的 QQ 接入仅支持 Windows | `winver` |
-| Python | **3.12+**（控制台自身用） | `python --version` |
+| 操作系统 | Windows 10 / 11（x64）**或** Linux x64（Ubuntu 22.04/24.04；Debian 12 尽力） | `winver` / `lsb_release -a` |
+| Python | **3.12+**（控制台自身与 AstrBot 都要） | `python --version` / `python3 --version` |
 | 磁盘 | 至少 **3 GB** 空闲（两个项目 + 依赖 + 缓存） | 「① 总览」环境自检会显示 |
 | 网络 | 能访问 GitHub / PyPI / 大模型 API | 浏览器打开 github.com |
 | Git（可选） | 自动部署 AstrBot 需要；没有可用离线包 | `git --version` |
-| Node.js（可选） | 只有 SnowLuma **lite** 版需要（≥ 24.22.1）；**full** 版自带 | `node --version` |
+| Node.js（可选） | 只有 SnowLuma **lite** 版需要（`^24.22.1 \|\| >=26.12.1`）；**full** 版自带 | `node --version` |
+| Linux 专有：QQ 注入前置 | node 的 `cap_sys_ptrace` 能力位 + Yama `ptrace_scope` ≤ 2 + 与 QQ 同一个 uid | 见 [LINUX.md](LINUX.md) §4 |
 
 「① 总览 → 环境自检」会把上面这些逐条列出来，缺什么一眼能看到。
+Linux 上还会多出 `ptrace_scope` / `node 的 cap_sys_ptrace` / 图形会话（DISPLAY）/ `python3-venv`
+这几项，每一项的修复命令直接写在页面上。
 
 ---
 
@@ -27,20 +33,29 @@
 
 ### 1.1 启动控制台
 
-双击项目根目录的 **`一键启动.bat`**。它会依次：
+**Windows**：双击项目根目录的 **`一键启动.bat`**。**Linux**：在项目根目录运行 **`./一键启动.sh`**。
+两者做的是同一件事：
 
 1. 检查 `.venv`，没有就创建（优先 `uv venv --python 3.12 .venv`，没有 uv 则 `python -m venv .venv`）；
 2. 安装 `requirements.txt`（已装则跳过）；
 3. 5 秒后自动打开 <http://127.0.0.1:8790>；
 4. 前台运行 `python -m slab serve`。
 
-> 窗口关掉 = 控制台停止，同时会停掉它启动的 SnowLuma / AstrBot。这是有意设计的（不留孤儿进程）。
+> 窗口/终端关掉 = 控制台停止，同时会停掉它启动的 SnowLuma / AstrBot。这是有意设计的（不留孤儿进程）。
+> Linux 上关终端同样是停控制台；想长期挂着用 `systemd --user`（[LINUX.md](LINUX.md) §8）。
 
 手动等价命令：
 
 ```bat
+:: Windows
 cd /d <项目目录>
 .venv\Scripts\python.exe -m slab serve
+```
+
+```bash
+# Linux
+cd <项目目录>
+.venv/bin/python3 -m slab serve
 ```
 
 ### 1.2 安装两个项目
@@ -48,6 +63,8 @@ cd /d <项目目录>
 打开「**② 部署**」页：
 
 1. **SnowLuma**：选版本（`latest` 即可）→ 安装类型选 **full**（自带 Node，推荐）→ 点 **下载安装**。
+   控制台会按平台自动选资产：Windows 是 `win-x64` 的 zip，Linux 是 `linux-x64` / `linux-arm64` 的 tar.gz，
+   full 版都自带 `node`（Linux 上是 `./node`，解压后自动 `chmod +x`）。
 2. **AstrBot**：分支保持 `main` → 点 **克隆并安装依赖**（会 `git clone` + 建独立虚拟环境 + 装依赖）。
 3. 也可以直接点右上角 **一键安装两个项目**，两者按顺序安装。
 
@@ -76,8 +93,10 @@ cd /d <项目目录>
 
 ### 2.1 SnowLuma（手工）
 
-1. 从 SnowLuma 官方仓库的 Releases 下载 **Windows full 版**压缩包（自带 `node.exe`）。
+1. 从 SnowLuma 官方仓库的 Releases 下载对应平台的 **full 版**：
+   Windows 用 `win-x64` 的 zip（自带 `node.exe`），Linux 用 `linux-x64` / `linux-arm64` 的 tar.gz（自带 `./node`）。
 2. 解压到 `runtime/snowluma/`（确保目录里有启动用的 `node`/`exe` 与 `config/`）。
+   Linux 上还要保住可执行位：`chmod +x runtime/snowluma/node`（tar 一般自带，zip 转存会丢）。
 3. 首次启动后，浏览器打开 `http://127.0.0.1:5099` 扫码登录 QQ。
 4. OneBot 适配器配置在 `runtime/snowluma/config/onebot*.json`，关键字段：
 
@@ -95,12 +114,23 @@ cd /d <项目目录>
 ### 2.2 AstrBot（手工）
 
 ```bat
+:: Windows
 cd /d <项目目录>\runtime
 git clone https://github.com/AstrBotDevs/AstrBot.git astrbot
 cd astrbot
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe main.py
+```
+
+```bash
+# Linux（注意：AstrBot 要求 Python ≥ 3.12；Ubuntu 22.04 需先按 LINUX.md §1.2 补 3.12）
+cd <项目目录>/runtime
+git clone https://github.com/AstrBotDevs/AstrBot.git astrbot
+cd astrbot
+python3.12 -m venv .venv          # 或用 uv venv --python 3.12 .venv
+.venv/bin/python3 -m pip install -r requirements.txt
+.venv/bin/python3 main.py
 ```
 
 启动后打开 `http://127.0.0.1:6185`（默认账号 `astrbot`，密码在控制台「③ 配置」里可以看到/改）。
@@ -131,8 +161,15 @@ python -m venv .venv
 ### 2.3 不需要界面的命令行安装
 
 ```bat
+:: Windows
 .venv\Scripts\python.exe -m slab install both
 .venv\Scripts\python.exe -m slab doctor        :: 环境/配置/端口自检
+```
+
+```bash
+# Linux
+.venv/bin/python3 -m slab install both
+.venv/bin/python3 -m slab doctor
 ```
 
 ---
@@ -173,24 +210,29 @@ runtime\astrbot\.venv\Scripts\python.exe -m pip install --no-index --find-links 
 > 离线环境下「② 部署」页的下载/克隆会失败（那是正常的，它需要外网）。
 > 只要 `runtime/snowluma` 与 `runtime/astrbot` 目录存在，「总览」就会显示 **已安装**，
 > 之后可以正常配置、启动、联调。
+>
+> Linux 上步骤一样，只是把 `python.exe` → `python3`、`\` → `/`、`tar -xf` 换成 `tar -xzf`（tar.gz 包）。
 
 ---
 
 ## 3.5 自定义安装位置 / 数据目录（多盘、共享机）
 
-默认两个项目都装在**程序目录下的 `runtime\`**；想放 D 盘或指定目录：
+默认两个项目都装在**程序目录下的 `runtime/`**；Windows 想放 D 盘、Linux 想放到别的挂载点：
 
-1. 「③ 配置」→「安装位置与备份」→ 点 **选择…**（桌面版用系统原生对话框；浏览器版由后端弹 PowerShell 目录框），
-   或直接把路径粘进输入框，例如 `D:\bots\snowluma`、`D:\bots\astrbot`；
+1. 「③ 配置」→「安装位置与备份」→ 点 **选择…**（桌面版用系统原生对话框；浏览器版由后端弹系统目录框，
+   Linux 需要 `zenity` 或 `kdialog`，都没有就手输路径），
+   或直接把路径粘进输入框，例如 `D:\bots\snowluma`、`/opt/bots/snowluma`；
 2. 点「保存设置」；
 3. 回「② 部署」重新安装（或手动把已有目录搬过去后，在配置里指向新路径）。
 
 注意：
 
-- 目录必须是**本机绝对路径**，不能指向 `C:\Windows` 等系统目录；父目录不存在会自动创建；
+- 目录必须是**本机绝对路径**，不能指向 `C:\Windows` / `/usr` 等系统目录；父目录不存在会自动创建；
+- Linux 上目录要给当前用户可写（**不要**把控制台或 QQ 用 sudo 跑，见 [LINUX.md](LINUX.md) §4.3）；
 - 改完安装目录后，旧的安装不会自动搬走，可以手动移动整个目录（`config/` 与 `data/` 一起搬）；
 - **数据目录**（配置、日志、下载缓存）固定在程序旁边：exe 版是 `<程序目录>\data`，桌面版是
-  `%APPDATA%\SnowLuma AstrBot Console\data`。想整体换盘就把程序文件夹一起搬走；
+  `%APPDATA%\SnowLuma AstrBot Console\data`；Linux 上是 `~/.local/share/SnowLumaAstrBot/data`。
+  想整体换位置就设 `SLAB_STORAGE_ROOT`（Linux 推荐）或把程序文件夹一起搬走；
 - 「导出配置」会把安装目录、端口、QQ 号、API Key 一起导出（含密钥，别乱发）；
   「导入配置」是**整份覆盖**，换机器时最省事，导入后建议重启一次控制台。
 
@@ -202,13 +244,21 @@ runtime\astrbot\.venv\Scripts\python.exe -m pip install --no-index --find-links 
 **先定位占用者**： «① 总览 → 端口占用» 表里已经写了 `PID 12345 xxx.exe`，或者：
 
 ```bat
+:: Windows
 netstat -ano -p TCP | findstr :6199
 tasklist /FI "PID eq <上一步的PID>"
 ```
 
+```bash
+# Linux（控制台自己也用 /proc 拿占用者；读不到 fd 时用 sudo ss）
+ss -ltnp 'sport = :6199'
+sudo ss -ltnp | grep -E ':(8790|6185|5099|6199)\b'
+```
+
 **处置顺序**：
 
-1. **是上一个控制台没退干净**：任务管理器结束该 `python.exe`，或 `taskkill /PID <pid> /T /F`。
+1. **是上一个控制台没退干净**：任务管理器结束该 `python.exe`，或 `taskkill /PID <pid> /T /F`
+   （Linux：`kill <pid>`；控制台退出时会先对进程组发 `SIGTERM`，不会留孤儿）。
 2. **是我们自己的服务残留**（SnowLuma/AstrBot 卡死）：在「④ 运行」页点对应卡片 **停止** → **启动**；
    停不掉就直接杀 PID，然后点「重启全部」。
 3. **是别的软件占了**：在「③ 配置」换端口 → 保存 → 「⑤ 联调」写入联动配置 → 「④ 运行」重启全部。
@@ -217,7 +267,7 @@ tasklist /FI "PID eq <上一步的PID>"
 
 | 端口 | 建议换成 | 注意 |
 | --- | --- | --- |
-| 8790（控制台） | 8791 / 18790 | 换后访问地址要跟着改；`一键启动.bat` 里的 URL 是 8790，需要自己改或直接用新地址访问 |
+| 8790（控制台） | 8791 / 18790 | 换后访问地址要跟着改；`一键启动.bat`（Linux：`一键启动.sh`）里的 URL 是 8790，需要自己改或直接用新地址访问 |
 | 6185（AstrBot） | 6285 / 16185 | 改完在「运行」页重新打开面板链接 |
 | 5099（SnowLuma） | 5199 / 15099 | 同上 |
 | 6199（OneBot） | 6299 / 16199 | **两侧会自动同步**，不用手动改两个项目 |
@@ -292,7 +342,9 @@ xcopy /E /I /Y runtime\astrbot backup\astrbot-20251029
 
 ## 8. 部署检查清单（装机后逐条对照）
 
-- [ ]「一键启动.bat」跑完，浏览器能打开 <http://127.0.0.1:8790>
+通用：
+
+- [ ]「一键启动.bat」/「一键启动.sh」跑完，浏览器能打开 <http://127.0.0.1:8790>
 - [ ]「① 总览」环境自检：Python ✓、Git ✓（或已用离线包）、磁盘 ≥ 3 GB
 - [ ]「② 部署」两个项目都显示 **已安装**
 - [ ]「③ 配置」QQ 号、API Key、模型名已填，`保存设置` 无红色报错
@@ -300,3 +352,12 @@ xcopy /E /I /Y runtime\astrbot backup\astrbot-20251029
 - [ ]「④ 运行」两个服务绿灯；SnowLuma 面板里 QQ 显示已登录
 - [ ]「① 总览」OneBot 连接灯为绿（多开 QQ 时至少一条正常即可）
 - [ ] QQ 里 @机器人 或发 `/你好` 能收到回复
+
+Linux 额外（详见 [LINUX.md](LINUX.md)）：
+
+- [ ] `python3 --version` ≥ 3.12；`python3 -c "import venv, ensurepip"` 不报错
+- [ ] 官方 Linux QQ 已装（`/opt/QQ`）并在图形会话里扫码登录成功
+- [ ] `getcap "$(readlink -f <存储根>/runtime/snowluma/node)"` 有 `cap_sys_ptrace=ep`
+- [ ] `cat /proc/sys/kernel/yama/ptrace_scope` ≤ 2（不是 3）
+- [ ] 控制台与 QQ 都是同一个普通用户（**都没用 sudo**）
+- [ ] `echo $DISPLAY` 非空（无头机器按 LINUX.md §7 起 Xvfb）

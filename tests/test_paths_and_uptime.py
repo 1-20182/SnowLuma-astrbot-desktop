@@ -79,6 +79,21 @@ def test_pick_dir_cancel(monkeypatch):
     assert body["ok"] is False and body["cancelled"] is True
 
 
+def test_pick_dir_native_dispatches_per_platform(monkeypatch):
+    """目录选择框的实现按平台来：Windows 用 PowerShell，Linux 用 zenity/kdialog。"""
+
+    from slab import plat
+
+    calls: list[str] = []
+    monkeypatch.setattr(routes_deploy, "_pick_dir_windows",
+                        lambda title, initial: calls.append("windows") or {"ok": True, "path": "win"})
+    monkeypatch.setattr(routes_deploy, "_pick_dir_posix",
+                        lambda title, initial: calls.append("posix") or {"ok": True, "path": "posix"})
+    body = routes_deploy._pick_dir_native("选择目录", "")
+    assert body["ok"] is True
+    assert calls == ["windows" if plat.IS_WINDOWS else "posix"]
+
+
 def test_config_page_has_path_controls():
     html = INDEX.read_text("utf-8")
     for needle in ('id="cfg-snowluma-dir"', 'id="cfg-astrbot-dir"', 'id="cfg-data-dir"',

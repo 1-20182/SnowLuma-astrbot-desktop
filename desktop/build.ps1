@@ -91,6 +91,16 @@ $electronExe = Join-Path $AppDir "electron.exe"
 $targetExe = Join-Path $AppDir "$ProjectName.exe"
 if (Test-Path $electronExe) { Move-Item $electronExe $targetExe -Force }
 
+# 1b) 版本号文件：Electron 的 dist 自带一个叫 version 的文件（内容是 Electron 版本，如 33.4.11）。
+#     控制台的「升级」按"压缩包里最浅的 VERSION"判版本（slab/upgrade.py::read_zip_version，
+#     文件名大小写不敏感），这个文件会被当成"新版本 33.4.11"显示给用户。
+#     Electron 运行时不读它 → 改名，并放一份我们自己的 VERSION。
+$electronVersionFile = Join-Path $AppDir "version"
+if (Test-Path $electronVersionFile) {
+    Move-Item $electronVersionFile (Join-Path $AppDir "electron-version") -Force
+}
+Copy-Item (Join-Path $Root "VERSION") (Join-Path $AppDir "VERSION") -Force
+
 # 2) 外壳代码 → resources\app
 $resApp = Join-Path $AppDir "resources\app"
 New-Item -ItemType Directory -Force $resApp | Out-Null

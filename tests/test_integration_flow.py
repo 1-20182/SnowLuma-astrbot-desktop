@@ -108,6 +108,11 @@ def test_shutdown_endpoint_stops_everything(monkeypatch):
 
     called: dict = {}
     monkeypatch.setattr(os, "_exit", lambda code=0: called.setdefault("code", code), raising=False)
+    # 退出流程里会扫"残留进程"并 taskkill，测试环境必须挡住：
+    # 否则跑一次 pytest 就会把开发者本机正在运行的 SnowLuma / AstrBot 一起杀掉。
+    import slab.orphans as _orphans
+
+    monkeypatch.setattr(_orphans, "cleanup", lambda *a, **kw: {"ok": True, "items": [], "killed": []})
     with TestClient(create_app()) as c:
         r = c.post("/api/system/shutdown")
         assert r.status_code == 200

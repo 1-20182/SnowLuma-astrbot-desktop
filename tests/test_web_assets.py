@@ -286,7 +286,9 @@ def test_launcher_bat():
 def test_docs_exist_and_cover_key_topics():
     readme = (ROOT / "README.md").read_text("utf-8")
     assert "SnowLuma" in readme and "AstrBot" in readme
-    assert "30 秒快速开始" in readme
+    # 1.7.2 重写后的 README 是「快速开始（3 步）」；这里按当前结构断言，
+    # 不为了过测试反向改 README 措辞。
+    assert "快速开始（3 步）" in readme
     assert "native" in readme and "bridge" in readme
     assert "免责声明" in readme
     assert "docs/TROUBLESHOOTING.md" in readme

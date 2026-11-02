@@ -11,8 +11,14 @@
  *
  * 后端来源（按优先级）：
  *   1. 环境变量 SLAB_BACKEND_EXE
- *   2. resources/backend/SnowLuma-AstrBot-Console.exe（打包后）
- *   3. ../dist/SnowLuma-AstrBot-Console/SnowLuma-AstrBot-Console.exe（开发时）
+ *   2. resources/backend/SnowLuma-AstrBot-Console[.exe]（打包后）
+ *   3. ../dist/SnowLuma-AstrBot-Console/SnowLuma-AstrBot-Console[.exe]（开发时）
+ *
+ * 跨平台差异（Windows / Linux）在这里的落点只有四处，全部用 IS_WIN 收口：
+ *   - 后端子进程怎么"按整棵树"结束：Windows taskkill /T，POSIX 进程组（detached + killpg）
+ *   - 后端可执行文件名：Windows 带 .exe，Linux 无扩展名
+ *   - 数据放哪：Windows 挑非 C 盘，Linux 用 XDG（root 分区快满了才换大盘）
+ *   - 窗口图标：Windows .ico，Linux .png
  */
 
 const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
@@ -20,11 +26,14 @@ const { spawn, execFile, execFileSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
+const os = require('os');
 const path = require('path');
 
 const SMOKE = process.argv.includes('--smoke-test');
 const IS_WIN = process.platform === 'win32';
 const APP_TITLE = 'SnowLuma × AstrBot 联合控制台';
+/** 后端可执行文件名：PyInstaller onedir 产物在 Linux 上没有扩展名。 */
+const BACKEND_BIN = IS_WIN ? 'SnowLuma-AstrBot-Console.exe' : 'SnowLuma-AstrBot-Console';
 
 let backend = null;          // 后端子进程
 let backendPort = 0;
@@ -49,12 +58,28 @@ function notify(title, message) {
 function resolveBackendExe() {
   const candidates = [
     process.env.SLAB_BACKEND_EXE,
-    path.join(process.resourcesPath || '', 'backend', 'SnowLuma-AstrBot-Console.exe'),
-    path.join(__dirname, '..', 'dist', 'SnowLuma-AstrBot-Console', 'SnowLuma-AstrBot-Console.exe'),
+    path.join(process.resourcesPath || '', 'backend', BACKEND_BIN),
+    path.join(__dirname, '..', 'dist', 'SnowLuma-AstrBot-Console', BACKEND_BIN),
   ].filter(Boolean);
 
   for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
+    if (!fs.existsSync(candidate)) continue;
+    if (!IS_WIN) {
+      // Linux 上可执行位会丢：tar.gz 用 Windows 工具/文件管理器解压、或者从 U 盘拷贝过来
+      // 都会变成 644，spawn 直接 EACCES。这里补一次（自家产物，补权限是安全的）。
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+      } catch (err) {
+        try {
+          fs.chmodSync(candidate, 0o755);
+          log('补上可执行位:', candidate);
+        } catch (err2) {
+          log('无法补可执行位:', candidate, err2 && err2.message);
+          continue;
+        }
+      }
+    }
+    return candidate;
   }
   return null;
 }
@@ -110,26 +135,177 @@ async function waitHealthy(port, timeoutMs = 45000) {
   return false;
 }
 
-function killTree(pid) {
-  if (!pid) return;
-  if (IS_WIN) {
-    // /T 连带子进程（SnowLuma 的 node.exe、AstrBot 的 python.exe）
-    execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (err) => {
-      if (err) log('taskkill:', err.message);
-    });
-  } else {
-    try { process.kill(-pid, 'SIGTERM'); } catch (e) { log('kill:', e.message); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 进程组里还有活着的人吗？（-pid 是"整组"的写法，pgid 就是后端自己） */
+function groupAlive(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    return false;
   }
 }
 
+/**
+ * 给"整个进程组"发信号。
+ *
+ * 为什么必须先试 -pid：后端起的时候是 detached:true，内核把它 setpgid 成了新进程组的组长
+ * （pgid == pid），它拉起的 SnowLuma/QQ node 进程、AstrBot python 进程都留在这个组里。
+ * 只 process.kill(pid) 只能杀掉组长，孙子进程会变成孤儿继续占着 6185/6199 端口。
+ * 组杀失败（ESRCH = 组里没人了；或者是没被做成组长的老后端）时退化为只发给 pid。
+ */
+function signalGroup(pid, signal) {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch (err) {
+    try {
+      process.kill(pid, signal);
+      return true;
+    } catch (err2) {
+      log(`signal ${signal} ${pid} 失败:`, err2 && err2.message);
+      return false;
+    }
+  }
+}
+
+async function killTree(pid, graceMs = 2500) {
+  if (!pid) return;
+  if (IS_WIN) {
+    // /T 连带子进程（SnowLuma 的 node.exe、AstrBot 的 python.exe）
+    await new Promise((resolve) => {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (err) => {
+        if (err) log('taskkill:', err.message);
+        resolve();
+      });
+    });
+    return;
+  }
+  // POSIX：先 SIGTERM 给优雅收尾的机会（SnowLuma 要先 dispose OneBot、关日志），
+  // 等 2.5 秒还不走再 SIGKILL 整组——直接 SIGKILL 会留下没关干净的 QQ/端口占用。
+  if (!signalGroup(pid, 'SIGTERM')) return;
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    if (!groupAlive(pid)) return;
+    await sleep(100);
+  }
+  log('进程组在宽限期内没退出，升级为 SIGKILL:', pid);
+  signalGroup(pid, 'SIGKILL');
+}
+
 /* --------------------------------------------------------- 启动 / 停止后端 */
+/** 伪文件系统：不是真实存储，选了只会把数据写进内存或者根本写不进去。 */
+const PSEUDO_FS = new Set([
+  'proc', 'sysfs', 'devtmpfs', 'devpts', 'tmpfs', 'cgroup', 'cgroup2', 'pstore',
+  'securityfs', 'debugfs', 'tracefs', 'configfs', 'fusectl', 'mqueue', 'hugetlbfs',
+  'bpf', 'autofs', 'binfmt_misc', 'nsfs', 'ramfs', 'squashfs', 'overlay', 'efivarfs',
+  'rpc_pipefs', 'selinuxfs', 'fuse.gvfsd-fuse', 'fuse.portal',
+]);
+
+/**
+ * 解析 /proc/mounts，返回真实的本地挂载点。
+ *
+ * Linux 没有盘符，能问的只有这里。做两件事：滤掉伪文件系统，解掉路径里的八进制转义
+ * （/proc/mounts 把空格写成 \040，否则后面 statfs / mkdir 全对不上）。
+ */
+function linuxMounts() {
+  let text = '';
+  try {
+    text = fs.readFileSync('/proc/mounts', 'utf8');
+  } catch (err) {
+    log('/proc/mounts 读不到（容器/受限环境），只用 XDG 用户目录:', err && err.message);
+    return [];
+  }
+  const mounts = [];
+  for (const line of text.split('\n')) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 3) continue;
+    const [source, rawMount, fstype] = parts;
+    if (PSEUDO_FS.has(fstype)) continue;
+    if (!rawMount.startsWith('/')) continue;
+    const mount = rawMount.replace(/\\([0-7]{3})/g, (_m, oct) => String.fromCharCode(parseInt(oct, 8)));
+    mounts.push({ source, mount, fstype });
+  }
+  return mounts;
+}
+
+function freeBytes(target) {
+  try {
+    const st = fs.statfsSync(target);
+    return Number(st.bavail) * Number(st.bsize);
+  } catch (err) {
+    return 0;   // 光驱 / 网络盘 / 没权限：当作不能用
+  }
+}
+
+function isWritableDir(dir) {
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/** 找出目标路径落在哪个挂载点上（最长前缀匹配）。 */
+function mountOf(target, mounts) {
+  let best = null;
+  for (const m of mounts) {
+    const base = m.mount === '/' ? '/' : m.mount.replace(/\/+$/, '');
+    if (target === base || target.startsWith(base === '/' ? '/' : `${base}/`)) {
+      if (!best || base.length > best.mount.length) best = m;
+    }
+  }
+  return best;
+}
+
+/**
+ * Linux 侧"数据放哪"：
+ *   1. SLAB_STORAGE_ROOT 永远优先（调用方已经处理）；
+ *   2. 默认用 XDG（$XDG_DATA_HOME 或 ~/.local/share）/SnowLumaAstrBot —— 与后端
+ *      slab/plat.default_storage_base() 完全一致，不需要 root，跟着用户走；
+ *   3. 只有当"XDG 所在的盘快满了"（< 10 GB）而另有更大的可写挂载点时，才把数据挪到
+ *      那个大盘上。镜像 + 运行时动辄几个 GB，塞满 root 分区会把系统拖死；
+ *      但反过来也不能见大就用（U 盘、网络盘挂上去就变成数据盘会很惊悚），所以设了门槛。
+ */
+function pickStorageRootPosix() {
+  const xdgEnv = (process.env.XDG_DATA_HOME || '').trim();
+  const xdg = xdgEnv || path.join(os.homedir(), '.local', 'share');
+  const mounts = linuxMounts();
+  const homeMount = mountOf(xdg, mounts) || { mount: '/' };
+  const homeFree = freeBytes(homeMount.mount);
+  const TIGHT = 10 * 1024 ** 3;
+
+  let best = null;
+  for (const m of mounts) {
+    if (!isWritableDir(m.mount)) continue;
+    const free = freeBytes(m.mount);
+    if (free <= 0) continue;
+    if (!best || free > best.free) best = { ...m, free };
+  }
+
+  if (best && best.mount !== homeMount.mount && homeFree < TIGHT && best.free > homeFree
+      && isWritableDir(best.mount)) {
+    log(`root 分区可用 ${(homeFree / 1024 ** 3).toFixed(1)} GB，改用更大的挂载点:`,
+        best.mount, `${(best.free / 1024 ** 3).toFixed(1)} GB`);
+    return path.join(best.mount, 'SnowLumaAstrBot');
+  }
+  log('storage root:', xdg, '（挂载点:', homeMount.mount, '可用',
+      `${(homeFree / 1024 ** 3).toFixed(1)} GB）`);
+  return path.join(xdg, 'SnowLumaAstrBot');
+}
+
 /**
  * 选一个"放数据/安装"的根目录：默认非 C 盘（剩余空间最大的本地固定盘），
  * 只有一块盘时才用 C。结果形如 D:\SnowLumaAstrBot。
+ * Linux 走 pickStorageRootPosix()（XDG，root 分区紧张时才换大盘）。
  */
 function pickStorageRoot() {
   const env = (process.env.SLAB_STORAGE_ROOT || '').trim();
-  if (env) return env;
+  if (env) return env;   // 三个平台都优先听环境变量
+
+  if (!IS_WIN) return pickStorageRootPosix();
 
   // 不用 PowerShell 枚举磁盘：execFileSync 会阻塞主线程 1~2 秒，
   // 那几秒里 splash / 窗口就是"未响应"状态。fs.statfsSync 是毫秒级的系统调用。
@@ -152,7 +328,7 @@ function pickStorageRoot() {
 async function startBackend() {
   const exe = resolveBackendExe();
   if (!exe) {
-    notify(APP_TITLE, '找不到控制台后端程序。\n\n请确认 resources\\backend\\SnowLuma-AstrBot-Console.exe 存在，'
+    notify(APP_TITLE, `找不到控制台后端程序。\n\n请确认 ${path.join('resources', 'backend', BACKEND_BIN)} 存在，`
       + '或设置环境变量 SLAB_BACKEND_EXE 指向它。');
     return false;
   }
@@ -198,6 +374,12 @@ async function startBackend() {
       PYTHONIOENCODING: 'utf-8',
     },
     windowsHide: true,
+    // POSIX 必须 detached（等价 setsid）：让后端成为【新进程组】的组长。
+    //   1) 之后 process.kill(-pid) 才是"杀掉整棵树"，SnowLuma 的 node、AstrBot 的 python
+    //      都还在这个组里，不会被漏下（Windows 那边靠 taskkill /T 达到同样效果）；
+    //   2) 外壳退出/崩溃时，后端不会跟着收到终端会话的 SIGHUP 而"半个死"。
+    //   Windows 不能开 detached：那会多弹一个黑色控制台窗口。
+    detached: !IS_WIN,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -208,9 +390,20 @@ async function startBackend() {
     backend = null;
     if (quitting || backendExitHandled) return;
     backendExitHandled = true;
-    notify(APP_TITLE, `控制台后端意外退出（退出码 ${code}）。\n\n可以在用户数据目录的 data\\logs\\console.log 里查看原因。`);
+    notify(APP_TITLE, `控制台后端意外退出（退出码 ${code}）。\n\n`
+      + `可以在用户数据目录的 ${path.join('data', 'logs', 'console.log')} 里查看原因。`);
     app.quit();
   });
+
+  // 兜底：detached 的后端在 POSIX 上是独立进程组，外壳自己崩了（或被 SIGKILL）它不会跟着死，
+  // 那就是典型的"窗口没了后端还在跑"。同步退出钩子里补一刀 SIGKILL。
+  if (!IS_WIN) {
+    process.once('exit', () => {
+      const pid = backend && backend.pid;
+      if (!pid) return;
+      try { process.kill(-pid, 'SIGKILL'); } catch (err) { /* 已经没了 */ }
+    });
+  }
 
   const ok = await waitHealthy(backendPort);
   if (!ok) {
@@ -229,22 +422,33 @@ async function stopBackend() {
   } catch (err) {
     log('shutdown request failed', err && err.message);
   }
-  // 2) 等它自己退（最多 6 秒），仍然活着就强杀整棵树兜底
-  const deadline = Date.now() + 6000;
+  // 2) 等它自己退（最多 4 秒），仍然活着就强杀整棵树兜底
+  //    为什么是 4 秒：外面 quitApp() 有 9 秒看门狗，这里 4s + killTree 的 2.2s 宽限 + 0.2s
+  //    收尾 = 6.4s，留足余量，不会出现"看门狗先开火、进程树没杀干净"的竞态。
+  const deadline = Date.now() + 4000;
   let alive = true;
   while (Date.now() < deadline) {
     if (!backend || backend.exitCode !== null) { alive = false; break; }
-    await new Promise((r) => setTimeout(r, 200));
+    await sleep(200);
   }
   if (alive) {
     log('backend did not exit in time, killing tree', pid);
-    killTree(pid);
+    await killTree(pid, 2200);
   }
-  await new Promise((r) => setTimeout(r, 400));
+  await sleep(200);
   backend = null;
 }
 
 /* -------------------------------------------------------------------- 窗口 */
+/** 窗口 / 任务栏图标：Windows 读 .ico，Linux 的窗口管理器读 .png。 */
+function windowIconPath() {
+  for (const name of (IS_WIN ? ['icon.ico', 'icon.png'] : ['icon.png', 'icon.ico'])) {
+    const file = path.join(__dirname, 'assets', name);
+    if (fs.existsSync(file)) return file;
+  }
+  return undefined;
+}
+
 function createSplash() {
   splash = new BrowserWindow({
     width: 460,
@@ -275,9 +479,9 @@ function createWindow(targetUrl) {
     skipTaskbar: false,
     backgroundColor: '#f2f2f5',
     title: APP_TITLE,
-    icon: fs.existsSync(path.join(__dirname, 'assets', 'icon.ico'))
-      ? path.join(__dirname, 'assets', 'icon.ico')
-      : undefined,
+    // 图标格式跟平台走：Windows 只认 .ico（任务栏/alt-tab 都读它），
+    // Linux 的窗口管理器（GTK/KDE）读 png，给 .ico 会被静默忽略变成默认齿轮图标。
+    icon: windowIconPath(),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

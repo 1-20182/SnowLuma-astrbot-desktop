@@ -8,6 +8,11 @@
 2. **「④ 运行 → 实时日志」**：绝大多数问题的真实原因就在这里（选服务 + 级别筛 error/warn）。
 3. **命令行自检**：`cd 项目目录 && .venv\Scripts\python.exe -m slab doctor`
    会打印环境、配置问题、四个端口占用情况。
+   Linux 上是 `.venv/bin/python3 -m slab doctor`。
+
+> **Linux 版**先看这三条（Windows 上不存在）：第 16 条 `setcap cap_sys_ptrace`、
+> 第 17 条 Yama `ptrace_scope`、第 18 条 `DISPLAY` / 图形会话。
+> 完整 Linux 指南在 [LINUX.md](LINUX.md)。
 
 ---
 
@@ -17,12 +22,12 @@
 
 **确认**
 
-* 黑色命令行窗口还开着吗？里面有 `Uvicorn running on http://127.0.0.1:8790` 吗？
+* 那个**命令行窗口 / 终端**还开着吗？里面有 `Uvicorn running on http://127.0.0.1:8790` 吗？
 * 窗口里有没有红色 Python 报错（traceback）？
 
 **处理**
 
-1. 窗口已经关了 / 报错退出 → 重新双击 **`一键启动.bat`**，看最后的 `[错误]` 提示。
+1. 窗口已经关了 / 报错退出 → 重新双击 **`一键启动.bat`**（Linux：重跑 `./一键启动.sh`），看最后的 `[错误]` 提示。
 2. 提示 `ModuleNotFoundError: No module named 'fastapi'`（或 uvicorn / httpx / websockets）→ 依赖没装全：
    ```bat
    .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -214,6 +219,9 @@ tasklist /FI "PID eq <上一步的PID>"
 3. 第三方「安全卫士」类软件同理，注意它们的「进程防护」会拦 `taskkill`，导致「停止」按钮无效。
 4. 公司电脑受管控（AppLocker/组策略）→ 需要 IT 放行，控制台无法绕过。
 
+> **Linux 上没有这一条**（没有杀软拦 `node`）。Linux 上「服务启动秒退」的等价原因多半是
+> 注入前置条件不满足（第 16、17 条）或缺 `python3-venv` / Python 版本不够。
+
 ---
 
 ## 10. 下载失败 / 卡在 `git clone` / 进度条不动
@@ -300,6 +308,84 @@ tasklist /FI "PID eq <上一步的PID>"
 - [ ] 改过配置后 **重启过服务**
 
 还不行就把「④ 运行」里 `astrbot` 与 `snowluma` 的 error 级日志复制出来，对照第 6 条逐项排查。
+
+---
+
+## 16. Linux：注入报 `EPERM` / `Operation not permitted`（缺 `cap_sys_ptrace`）
+
+> 本节只对 **Linux** 有效。Windows 上不会出这个错误（那边是 DLL 注入）。
+
+**现象**：日志里出现 `EPERM`、`attach failed`、`ptrace(PTRACE_ATTACH)` 之类的报错；
+「① 总览 → 环境自检」里 **「node 的 cap_sys_ptrace」** 一项是红或黄；QQ 明明登录了却接不上。
+
+**确认**
+
+```bash
+NODE="$(readlink -f ~/.local/share/SnowLumaAstrBot/runtime/snowluma/node)"
+getcap "$NODE"            # 期望：cap_sys_ptrace=ep；空 = 没有能力位
+findmnt -no OPTIONS "$(dirname "$NODE")" | grep -o nosuid   # 有输出说明挂载带 nosuid，能力位不生效
+```
+
+**处理**
+
+```bash
+sudo setcap cap_sys_ptrace=ep "$NODE"
+# 重启 SnowLuma（只重启 SnowLuma 即可，不必重启控制台）
+```
+
+- 一定要打**真实路径**（`readlink -f` 的结果），符号链接不算；
+- **升级 / 重装 SnowLuma 会换掉 node 文件 → 能力位丢失**，升级后必须重跑一次；
+- 文件所在分区是 `nosuid` 挂载时能力位无效 → 把存储根换到普通分区（`export SLAB_STORAGE_ROOT=/opt/…`），
+  或改用第 17 条的 `ptrace_scope=1` + 同 uid；
+- 控制台与 QQ **必须是同一个 uid**（都别用 sudo）；详见 [LINUX.md](LINUX.md) §4。
+
+---
+
+## 17. Linux：`ptrace_scope=3`（Yama 完全禁止 ptrace）
+
+**现象**：`环境自检` 里 **「ptrace_scope」** 一项红，提示 `Yama ptrace_scope=3`；注入一定失败。
+
+**确认**
+
+```bash
+cat /proc/sys/kernel/yama/ptrace_scope     # 3 = 完全禁止，连 root 都不行
+```
+
+**处理**
+
+```bash
+# 临时
+sudo sysctl -w kernel.yama.ptrace_scope=1
+# 永久（推荐）
+echo 'kernel.yama.ptrace_scope=1' | sudo tee /etc/sysctl.d/99-snowluma.conf
+sudo sysctl --system
+```
+
+0/1/2 都可用（1 是 Ubuntu 默认值，需要配合第 16 条的能力位）。值被云厂商镜像锁死、改不动时，
+只能换机器或找管理员。
+
+---
+
+## 18. Linux：QQ 起不来 / 扫码登录不了（没有图形会话）
+
+**现象**：`/opt/QQ/qq` 启动没反应或直接退出；日志里有 `cannot open display`；
+「环境自检」的 **「图形会话（DISPLAY）」** 一项黄/红。
+
+**确认**
+
+```bash
+echo "DISPLAY=[$DISPLAY] WAYLAND_DISPLAY=[$WAYLAND_DISPLAY]"   # 两个都空 = 没有图形会话
+ls /tmp/.X11-unix/                                             # 有 X0/X99 说明本机有 X 服务
+```
+
+**处理**
+
+1. 在**桌面会话**里（或通过远程桌面/物理显示器）操作：直接启动 QQ 扫码一次即可，SnowLuma 之后接管的是这个已登录进程；
+2. 纯 SSH 无头服务器：按 [LINUX.md](LINUX.md) §7 起 `Xvfb + fluxbox + x11vnc + noVNC`，
+   在 VNC 里开 QQ 扫码；带 `DISPLAY=:99` 的环境启动控制台；
+3. Wayland 桌面：QQ 走 XWayland，通常正常；若扫码窗口空白，试试 `GDK_BACKEND=x11` 或直接在 X11 会话登录。
+
+> 提示：SnowLuma **不会**自己弹二维码 —— 扫码始终发生在 QQ 客户端里。
 
 ---
 

@@ -1068,7 +1068,10 @@ async def probe(
         hint = "AstrBot 已就绪，OneBot 反向 WS 已在线" + (
             "，等待 SnowLuma 连接" if not log_info["platform_connected"] else ""
         )
-        suggestions.append("确认 SnowLuma 已登录 QQ 并已写入 astrbot 反向 WS 连接")
+        if str(cfg.link.mode) == "bridge":
+            suggestions.append("确认 SnowLuma 已登录 QQ：中继会自动接入 AstrBot，SnowLuma 侧不需要 wsClient")
+        else:
+            suggestions.append("确认 SnowLuma 已登录 QQ 并已写入 astrbot 反向 WS 连接")
 
     if log_info["port_in_use"]:
         suggestions.append(f"端口被占用：{log_info['port_in_use']}")
@@ -1110,7 +1113,11 @@ async def probe_onebot_ws(cfg: AppConfig, *, timeout: float = 3.0) -> Dict[str, 
     headers = {
         "User-Agent": "OneBot/11",
         "X-Self-ID": str(cfg.snowluma.qq_uin or "10000"),
-        "X-Client-Role": "universal",
+        # 只能用 event 角色：aiocqhttp 收到 universal/api 角色会把这条连接登记成
+        # 「可发送的 bot」，而它断开时是按 self_id 直接删登记的（不校验是不是自己），
+        # 探针一关连接就会把中继那条真实连接的登记删掉 —— 表现就是"能收不能发"
+        # （自检/修复验证全红，但 QQ 里的回复其实还是通的）。
+        "X-Client-Role": "event",
     }
     if cfg.link.token:
         headers["Authorization"] = f"Bearer {cfg.link.token}"

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -25,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from .. import envcheck, installer, paths
+from .. import envcheck, installer, paths, plat
 from ..config import get_config
 from ..events import bus
 from ..supervisor import supervisor
@@ -36,8 +37,12 @@ TARGETS = ("snowluma", "astrbot", "both")
 SERVICE_NAMES = ("snowluma", "astrbot")
 
 
+class _PickerUnavailable(RuntimeError):
+    """当前环境没有一个能弹目录选择框的程序（POSIX 上缺 zenity/kdialog）。"""
+
+
 # --------------------------------------------------------------------------- #
-# 目录选择（Windows 原生"浏览文件夹"对话框）
+# 目录选择（Windows: 原生"浏览文件夹"对话框；Linux: zenity / kdialog）
 # --------------------------------------------------------------------------- #
 _PICK_SCRIPT = """
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
@@ -59,7 +64,7 @@ def _ps_quote(value: str) -> str:
     return "'" + str(value or "").replace("'", "''") + "'"
 
 
-def _pick_dir_native(title: str, initial: str) -> Dict[str, Any]:
+def _pick_dir_windows(title: str, initial: str) -> Dict[str, Any]:
     """弹出 Windows 原生目录选择框（powershell 本身隐藏，只显示对话框）。"""
 
     import contextlib
@@ -89,16 +94,63 @@ def _pick_dir_native(title: str, initial: str) -> Dict[str, Any]:
     return {"ok": True, "path": chosen}
 
 
+def _pick_dir_posix(title: str, initial: str) -> Dict[str, Any]:
+    """POSIX：有 zenity 就用 zenity，其次 kdialog；都没有就抛 :class:`_PickerUnavailable`。
+
+    浏览器拿不到本机绝对路径，无头/最小安装的 Linux 上也常常没装任何对话框程序，
+    这时前端应退回"手动输入路径"（路由返回 501 并带上提示）。
+    """
+
+    zenity = shutil.which("zenity")
+    kdialog = shutil.which("kdialog")
+    if zenity:
+        argv = [zenity, "--file-selection", "--directory", f"--title={title or '选择目录'}"]
+        if initial:
+            argv.append(f"--filename={str(initial).rstrip('/')}/")
+    elif kdialog:
+        argv = [kdialog, "--title", title or "选择目录", "--getexistingdirectory",
+                str(initial or Path.home())]
+    else:
+        raise _PickerUnavailable(
+            "当前环境没有图形目录选择框（缺 zenity / kdialog）。\n"
+            "下一步：手动输入完整路径（Linux 常用 /opt/SnowLuma 或 "
+            "$XDG_DATA_HOME/SnowLumaAstrBot）；"
+            "想在网页上弹框可以安装：sudo apt install -y zenity"
+        )
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)  # noqa: S603
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "cancelled": True, "error": "等待选择超时（10 分钟）"}
+    except OSError as exc:
+        raise _PickerUnavailable(f"目录选择框启动失败：{exc}。下一步：手动输入路径，或安装 zenity 后重试。") from exc
+    chosen = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not chosen:
+        return {"ok": False, "cancelled": True}
+    return {"ok": True, "path": chosen}
+
+
+def _pick_dir_native(title: str, initial: str) -> Dict[str, Any]:
+    """按平台弹出目录选择框（Windows: PowerShell；Linux: zenity/kdialog）。
+
+    没有可用对话框时抛 :class:`_PickerUnavailable`，由路由翻译成 501。
+    """
+
+    if plat.IS_WINDOWS:
+        return _pick_dir_windows(title, initial)
+    return _pick_dir_posix(title, initial)
+
+
 @router.post("/pick-dir")
 async def pick_dir(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """让用户选一个目录（浏览器拿不到绝对路径，由服务端弹原生对话框）。"""
 
-    if os.name != "nt":
-        raise HTTPException(501, "目录选择对话框目前只支持 Windows；请手动输入路径")
     data = payload or {}
-    return await asyncio.to_thread(
-        _pick_dir_native, str(data.get("title") or "选择目录"), str(data.get("initial") or "")
-    )
+    try:
+        return await asyncio.to_thread(
+            _pick_dir_native, str(data.get("title") or "选择目录"), str(data.get("initial") or "")
+        )
+    except _PickerUnavailable as exc:
+        raise HTTPException(501, str(exc)) from exc
 
 _jobs_lock = threading.RLock()
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -298,7 +350,7 @@ async def deploy_env(
     if not lite_ok:
         warnings.append(
             f"当前 Node.js {node_ver or '未安装'} 不满足 SnowLuma lite 版要求（{installer.NODE_REQUIRED}）"
-            "，请使用 full 版（自带 node.exe，推荐）。"
+            f"，请使用 full 版（自带 {plat.node_bin_name()}，推荐）。"
         )
     if ports["snowluma_webui"]["in_use"]:
         warnings.append(
@@ -341,7 +393,7 @@ async def deploy_env(
             "astrbot_reason": astrbot_reason,
             "github": github,
             "notes": [
-                "SnowLuma full 版自带 node.exe，开箱即用；lite 版需要 Node "
+                f"SnowLuma full 版自带 {plat.node_bin_name()}，开箱即用；lite 版需要 Node "
                 f"{installer.NODE_REQUIRED}。",
                 installer.ASTRBOT_DASHBOARD_NOTE,
             ],
@@ -468,29 +520,28 @@ def _open_dir_path(target: str, cfg) -> Path:
     return path
 
 
+def _open_path(path: Path) -> bool:
+    """在系统文件管理器里打开目录（Windows: explorer；Linux: xdg-open）；平台层统一处理。"""
+
+    return plat.open_path(Path(path))
+
+
 @router.post("/open-dir")
 async def open_dir(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
-    """在资源管理器里打开安装/数据目录（浏览器没有这个权限，由本机进程代劳）。"""
+    """在系统文件管理器里打开安装/数据目录（浏览器没有这个权限，由本机进程代劳）。"""
 
     data = payload or {}
     target = str(data.get("target") or "").strip().lower()
     path = _open_dir_path(target, get_config())
-    try:
-        if os.name == "nt":
-            subprocess.Popen(  # noqa: S603
-                ["explorer", str(path)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif hasattr(os, "startfile"):  # pragma: no cover - 非 Windows 兜底
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        else:  # pragma: no cover
-            subprocess.Popen(["xdg-open", str(path)], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"打开目录失败：{exc}。可以手动复制路径：{path}") from exc
-    bus.log("console", f"已在资源管理器中打开：{path}")
+    if not _open_path(path):
+        raise HTTPException(
+            501,
+            "当前环境打不开文件管理器"
+            + ("（explorer 启动失败）。" if plat.IS_WINDOWS else "（没装 xdg-open）。")
+            + f"下一步：手动打开这个路径：{path}",
+        )
+    where = "资源管理器" if plat.IS_WINDOWS else "文件管理器"
+    bus.log("console", f"已在{where}中打开：{path}")
     return {"ok": True, "path": str(path), "target": target}
 
 

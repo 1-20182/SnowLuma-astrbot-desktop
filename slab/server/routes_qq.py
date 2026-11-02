@@ -1,4 +1,9 @@
-"""QQ 客户端路由：检测 / 进程列表 / 隔离启动 / 只注入选中进程。"""
+"""QQ 客户端路由：检测 / 进程列表 / 隔离启动 / 只注入选中进程。
+
+平台差异说明（前端按 ``/api/qq/summary`` 里的 ``platform`` / ``clone_mode`` 渲染）：
+* Windows：``clone_mode="inject"``，深度分身 = 挂起创建 + 注入 sandbox DLL；
+* Linux：``clone_mode="home"``，没有 DLL 注入这回事，分身 = 独立 HOME 多开。
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, HTTPException
 
-from .. import qq, qqclone
+from .. import plat, qq, qqclone
 from ..config import get_config
 from ..events import bus
 from ..snowluma_admin import SnowLumaWebUI
@@ -45,14 +50,18 @@ async def launch_isolated(payload: Optional[Dict[str, Any]] = Body(default=None)
 
 @router.get("/clone/status")
 async def clone_status() -> Dict[str, Any]:
-    """深度分身准备情况（沙箱 DLL 是否带齐、数据目录在哪）。"""
+    """分身准备情况（Windows: 沙箱 DLL 是否带齐；Linux: 独立 HOME 目录与 mode=home）。"""
 
     return await asyncio.to_thread(qqclone.status)
 
 
 @router.post("/clone/launch")
 async def clone_launch(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
-    """深度分身启动：独立数据目录 + 互斥体改名 + 已知文件夹重定向（注入 sandbox DLL）。"""
+    """启动分身。
+
+    * Windows：深度分身（独立数据目录 + 互斥体改名 + 已知文件夹重定向，注入 sandbox DLL）；
+    * Linux：独立 HOME 分身（换 HOME 绕过 QQ 的单实例锁）。
+    """
 
     data = payload or {}
     clone_id = str(data.get("clone_id") or "bot").strip() or "bot"
@@ -60,16 +69,22 @@ async def clone_launch(payload: Optional[Dict[str, Any]] = Body(default=None)) -
     if not source:
         installs = await asyncio.to_thread(qq.list_installs)
         if not installs:
-            raise HTTPException(404, "没有找到 QQ.exe：请先安装 QQ（NT 版），或在「QQ 客户端」里指定路径")
+            if plat.IS_WINDOWS:
+                raise HTTPException(404, "没有找到 QQ.exe：请先安装 QQ（NT 版），或在「QQ 客户端」里指定路径")
+            raise HTTPException(404, "没有找到 QQ。下一步：" + qq.LINUX_INSTALL_HINT)
         source = installs[0]["exe"]
     try:
         result = await asyncio.to_thread(qqclone.launch_clone, source, clone_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except OSError as exc:
-        raise HTTPException(500, f"启动深度分身失败：{exc}（杀软拦截注入时请把安装目录加入白名单）") from exc
+        if plat.IS_WINDOWS:
+            hint = "（杀软拦截注入时请把安装目录加入白名单）"
+        else:
+            hint = "（Linux 上请确认可执行位与桌面会话：chmod +x /opt/QQ/qq、有 DISPLAY/WAYLAND_DISPLAY）"
+        raise HTTPException(500, f"启动分身失败：{exc}{hint}") from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"启动深度分身失败：{exc}") from exc
+        raise HTTPException(500, f"启动分身失败：{exc}") from exc
     return result
 
 

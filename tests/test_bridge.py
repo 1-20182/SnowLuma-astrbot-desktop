@@ -220,6 +220,57 @@ async def test_end_to_end_message_and_reply(cfg: AppConfig) -> None:
         await shutdown(astrbot_server, snowluma_server)
 
 
+async def test_duplicate_delivery_is_forwarded_once(cfg: AppConfig) -> None:
+    """同一条消息被投递两次（SnowLuma 直连 + 中继双通道）时只转发一次。
+
+    否则 AstrBot 处理两遍、回两遍 —— 用户看到的就是「发一条，机器人回两条」。
+    """
+
+    astrbot = FakeAstrBot()
+    snowluma = FakeSnowLuma()
+    astrbot_server, astrbot_port = await start(astrbot.handler)
+    snowluma_server, snowluma_port = await start(snowluma.handler)
+    cfg.link.ws_port = astrbot_port
+    cfg.snowluma.relay_port = snowluma_port
+
+    link = Bridge(cfg)
+    try:
+        await link.start()
+        assert await wait_until(lambda: astrbot.connected.is_set() and snowluma.connected.is_set())
+
+        event = {
+            "post_type": "message",
+            "message_type": "private",
+            "sub_type": "friend",
+            "time": 1700000000,
+            "self_id": 3985934176,
+            "user_id": 20002,
+            "message_id": 888,
+            "message": [{"type": "text", "data": {"text": "你好"}}],
+            "raw_message": "你好",
+            "sender": {"user_id": 20002, "nickname": "小明"},
+        }
+        await snowluma.push(event)
+        assert await wait_until(lambda: len(astrbot.events) == 1)
+
+        await snowluma.push(event)  # 同一条消息第二次抵达
+        assert await wait_until(lambda: link.stats["events_duplicate"] == 1)
+        await asyncio.sleep(0.2)
+        assert len(astrbot.events) == 1  # 只转发了一次
+        status = link.status()
+        assert status["stats"]["events_forwarded"] == 1
+        assert status["stats"]["events_in"] == 2
+        assert status["dedupe_window"] > 0
+
+        # 不同 message_id 的消息照常转发（去重不能误伤正常消息）
+        await snowluma.push({**event, "message_id": 889, "raw_message": "再来一条"})
+        assert await wait_until(lambda: len(astrbot.events) == 2)
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(link.stop(), timeout=5)
+        await shutdown(astrbot_server, snowluma_server)
+
+
 async def test_group_message_requires_at_or_prefix(cfg: AppConfig) -> None:
     astrbot = FakeAstrBot()
     snowluma = FakeSnowLuma()
@@ -680,3 +731,190 @@ def test_route_probe_and_accounts(monkeypatch, tmp_path) -> None:
     assert probe_body["onebot"]["relay_url"].endswith("/")
     assert accounts_body["ok"] is True
     assert isinstance(accounts_body["accounts"], list)
+
+
+# --------------------------------------------------------------------------- #
+# 「能收不能发」：aiocqhttp 的 bot 登记被别的同账号连接删掉
+# 现状：登记只在**重新建连**时恢复；接入方在 bridge 模式是中继、native 模式是 SnowLuma
+# --------------------------------------------------------------------------- #
+def test_bridge_status_counts_bridge_as_the_onebot_client(monkeypatch) -> None:
+    """bridge 模式下 SnowLuma 的 wsClients 为空是正常的，不能报「未连接」。"""
+
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "bridge"
+
+    async def fake_snowluma_probe(_cfg, **_kwargs):
+        return {"ok": True, "connected": False, "clients": [], "suggestions": [],
+                "accounts": ["3985934176"]}
+
+    async def fake_astrbot_probe(_cfg, **_kwargs):
+        return {"ok": True, "onebot_ws": {"ok": True, "status_code": 101}, "suggestions": []}
+
+    class StubBridge:
+        self_id = "3985934176"
+        running = True
+
+        def status(self):
+            return {
+                "running": True,
+                "self_id": "3985934176",
+                "upstream": {"connected": True, "state": "connected"},
+                "downstream": {"connected": True, "state": "connected"},
+                "stats": {},
+                "recent": [],
+            }
+
+    monkeypatch.setattr(snowluma_admin, "probe", fake_snowluma_probe)
+    monkeypatch.setattr(astrbot_admin, "probe", fake_astrbot_probe)
+    monkeypatch.setattr(bridge, "_bridge", StubBridge())
+
+    status = asyncio.run(bridge._collect_status(cfg))  # noqa: SLF001
+    assert status["onebot"]["clients_connected"] == 1
+    assert status["onebot"]["clients_source"] == "bridge"
+    assert status["onebot"]["ready"] is True
+
+
+def test_route_repair_bridge_restarts_bridge_and_retries(monkeypatch) -> None:
+    """bridge 模式下修复要走「重启中继重新登记」，且 ApiNotAvailable 后要重试一次。"""
+
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "bridge"
+    cfg.astrbot.admins_id = ["3317812824"]
+    cfg.astrbot.webui_username = "astrbot"
+    cfg.astrbot.webui_password = "pw"
+    monkeypatch.setattr("slab.server.routes_link.get_config", lambda: cfg)
+
+    reregistered: List[int] = []
+
+    async def fake_reregister(_cfg=None, **_kwargs):
+        reregistered.append(1)
+        return {"ok": True, "detail": "中继已重新接入 AstrBot"}
+
+    async def fake_single_channel(_cfg, **_kwargs):
+        return {"ok": True, "changed": False}
+
+    async def fake_stop(_name, *_a, **_k):  # SnowLuma 不该被重启
+        raise AssertionError("bridge 模式不应该重启 SnowLuma")
+
+    texts: List[str] = []
+
+    def fake_send(_base, _key, _umo, text, **_kwargs):
+        texts.append(text)
+        if len(texts) == 1:
+            # AstrBot 的 ApiNotAvailable 是空消息异常，OpenAPI 包成这句
+            return {"ok": False, "status": 400, "message": "Failed to send message: "}
+        return {"ok": True, "status": 200, "message": "已通过 AstrBot 发出"}
+
+    monkeypatch.setattr(bridge, "reregister", fake_reregister)
+    monkeypatch.setattr(snowluma_admin, "ensure_single_channel", fake_single_channel)
+    monkeypatch.setattr(astrbot_admin, "_dashboard_token", lambda *_a, **_k: "jwt")
+    monkeypatch.setattr(astrbot_admin, "ensure_api_key", lambda *_a, **_k: "key")
+    monkeypatch.setattr(astrbot_admin, "send_im_message", fake_send)
+    from slab import supervisor as supervisor_mod
+
+    monkeypatch.setattr(supervisor_mod.supervisor, "stop", fake_stop)
+
+    app = FastAPI()
+    app.include_router(routes_link.router)
+    with TestClient(app) as client:
+        body = client.post("/api/link/repair").json()
+
+    assert body["ok"] is True
+    assert len(reregistered) == 2, "首次登记 + 自愈重试各一次"
+    assert texts and "自愈重试" in texts[-1]
+    assert any("重启中继" in step["name"] for step in body["steps"])
+
+
+def test_looks_like_no_bot_matches_empty_api_not_available() -> None:
+    assert routes_link._looks_like_no_bot("Failed to send message: ") is True  # noqa: SLF001
+    assert routes_link._looks_like_no_bot("ApiNotAvailable") is True  # noqa: SLF001
+    assert routes_link._looks_like_no_bot("Failed to send message: not friend") is False  # noqa: SLF001
+
+
+def test_snowluma_probe_bridge_mode_does_not_ask_for_a_direct_client(monkeypatch, tmp_path) -> None:
+    """bridge 模式下「SnowLuma 没有 wsClient」是正常状态，不能引着用户去写直连。"""
+
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "bridge"
+    cfg.snowluma.install_dir = str(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "onebot.json").write_text("{}", encoding="utf-8")
+
+    async def fake_port_open(*_a, **_k):
+        return True
+
+    class FailingWebUI:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def login(self):
+            raise snowluma_admin.SnowLumaApiError("未授权")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(snowluma_admin, "_port_open_async", fake_port_open)
+    monkeypatch.setattr(snowluma_admin, "SnowLumaWebUI", FailingWebUI)
+    monkeypatch.setattr(snowluma_admin, "list_accounts", lambda *_a, **_k: ["3985934176"])
+    monkeypatch.setattr(snowluma_admin, "_process_state",
+                        lambda _name: {"status": "running", "pid": 1})
+    monkeypatch.setattr(snowluma_admin, "log_client_states",
+                        lambda *_a, **_k: {"available": False, "source_file": "", "age": 0.0,
+                                           "clients": []})
+    monkeypatch.setattr(snowluma_admin, "webui_credentials",
+                        lambda *_a, **_k: {"password": "pw", "username": "admin"})
+    monkeypatch.setattr(snowluma_admin, "account_sources",
+                        lambda *_a, **_k: {"files": [], "data_dirs": [], "logs": []})
+
+    result = asyncio.run(snowluma_admin.probe(cfg))
+    assert result["state"] == "relay"
+    assert not any("写入配置" in s for s in result["suggestions"])
+
+
+
+def test_snowluma_probe_warmup_does_not_blame_the_password(monkeypatch, tmp_path) -> None:
+    """刚点完「一键启动全部」时面板还没就绪，不能提示用户去查 WebUI 密码。"""
+
+    import time as _time
+
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "bridge"
+    cfg.snowluma.install_dir = str(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "onebot.json").write_text("{}", encoding="utf-8")
+
+    async def fake_port_open(*_a, **_k):
+        return True
+
+    class FailingWebUI:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def login(self):
+            raise snowluma_admin.SnowLumaApiError("未授权")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(snowluma_admin, "_port_open_async", fake_port_open)
+    monkeypatch.setattr(snowluma_admin, "SnowLumaWebUI", FailingWebUI)
+    monkeypatch.setattr(snowluma_admin, "list_accounts", lambda *_a, **_k: [])
+    monkeypatch.setattr(snowluma_admin, "_process_state",
+                        lambda _name: {"status": "running", "pid": 1,
+                                       "started_at": _time.time() - 3.0})
+    monkeypatch.setattr(snowluma_admin, "log_client_states",
+                        lambda *_a, **_k: {"available": False, "source_file": "", "age": 0.0,
+                                           "clients": []})
+    monkeypatch.setattr(snowluma_admin, "webui_credentials",
+                        lambda *_a, **_k: {"password": "pw", "username": "admin"})
+    monkeypatch.setattr(snowluma_admin, "account_sources",
+                        lambda *_a, **_k: {"files": [], "data_dirs": [], "logs": []})
+
+    result = asyncio.run(snowluma_admin.probe(cfg))
+    tips = " | ".join(result["suggestions"])
+    assert "刚启动" in tips
+    assert "检查 WebUI 密码" not in tips

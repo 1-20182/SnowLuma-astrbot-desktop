@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from .. import astrbot_admin, bridge, snowluma_admin
 from ..config import get_config
+from ..events import bus
 
 log = logging.getLogger("slab.link")
 
@@ -285,19 +286,38 @@ async def provider_test() -> Dict[str, Any]:
     return result
 
 
+def _looks_like_no_bot(message: str) -> bool:
+    """判断发送失败是不是「AstrBot 侧没有可用的 bot」。
+
+    aiocqhttp 的 ``ApiNotAvailable`` 是空消息异常，AstrBot 的 OpenAPI 把它包成
+    ``"Failed to send message: "``（冒号后面什么都没有）——所以不能只匹配类名。
+    """
+
+    text = str(message or "").strip()
+    return "ApiNotAvailable" in text or text.rstrip(": ").strip() == "Failed to send message"
+
+
 @router.post("/repair")
 async def repair(send_test: bool = Query(default=True)) -> Dict[str, Any]:
-    """修「能收到消息但 AstrBot 发不出去」（aiocqhttp 的 bot 登记被旧连接误删）。
+    """修「能收到消息但 AstrBot 发不出去」。
 
-    做法：停 SnowLuma → 等旧 WS 连接在 AstrBot 侧彻底注销 → 重启 SnowLuma
-    → 等它重新连上 → 用 AstrBot 的 OpenAPI 真发一条验证。
+    根因：aiocqhttp 把「可发送的 bot」按 ``X-Self-ID`` 存在一张表里，任意一条同
+    账号连接断开时它都直接删这条登记（不校验归属）。于是只要有一条**别的**同账号
+    连接连进来又断开（旧版控制台的 WS 握手探针就是），真实那条连接就变成「连着的
+    黑户」：事件照收，AstrBot 却认为没有 bot，所有回复都 ``ApiNotAvailable``。
+    只有重新建一次连接才会重新登记 —— 所以修法是「重启真正接进 AstrBot 的那一侧」：
+
+    * bridge 模式：接入方是内置中继 → 重启中继（SnowLuma 侧不用动）；
+    * native 模式：接入方是 SnowLuma 自己 → 重启 SnowLuma。
+
+    写完还会用 AstrBot 的 OpenAPI 真发一条验证；万一还是 ``ApiNotAvailable``，
+    会再自愈一次后重试。
     """
 
     from .. import astrbot_admin
-    from ..supervisor import supervisor as _sup
 
     cfg = get_config()
-    steps = []
+    steps: List[Dict[str, Any]] = []
 
     # native 模式下 AstrBot 直连 SnowLuma 的 WS 客户端，aiocqhttp 的 bot 登记很容易被
     # 新旧连接重叠误删（表现为"能收不能发"、群聊/插件全部失效）。中继模式由我们自己的
@@ -306,37 +326,58 @@ async def repair(send_test: bool = Query(default=True)) -> Dict[str, Any]:
         try:
             from ..config import store as _store
 
-            cfg = _store.apply_patch({"link": {"mode": "bridge"}})
+            _store.apply_patch({"link": {"mode": "bridge"}})
+            cfg = get_config()
             applied = await bridge.apply_link(cfg, restart=False, require_provider=False)
             ok_apply = bool(applied.get("ok")) or any(
                 s.get("step") == "verify" and not s.get("ok") for s in applied.get("steps", [])
             )
             steps.append({"name": "切换到中继模式", "ok": ok_apply,
-                          "detail": "已把两边配置改成交接给内置 bridge"})
+                          "detail": "已把两边配置改成交给内置 bridge"})
         except Exception as exc:  # noqa: BLE001
             steps.append({"name": "切换到中继模式", "ok": False, "detail": str(exc)})
 
-    await _sup.stop("snowluma")
-    await asyncio.sleep(3.0)
-    await _sup.start("snowluma")
-    steps.append({"name": "重启 SnowLuma", "ok": True, "detail": "已重启并等待重新注册"})
-    connected = False
-    for _ in range(30):
-        await asyncio.sleep(0.5)
-        try:
-            snap = await status()
-            if (snap.get("onebot") or {}).get("clients_connected"):
-                connected = True
-                break
-        except Exception:  # noqa: BLE001
-            pass
-    steps.append({"name": "OneBot 重新连接", "ok": connected,
-                  "detail": "clients=1" if connected else "30 秒内没连上，看 SnowLuma 日志"})
+    mode = str(cfg.link.mode)
 
-    await asyncio.sleep(1.5)
+    # 中继模式下先把 native 时代残留的直连 wsClient 清掉：
+    # 只要它在，SnowLuma 会把同一条 QQ 消息同时推给直连和中继，AstrBot 就回两遍。
+    if mode == "bridge":
+        try:
+            fixed = await snowluma_admin.ensure_single_channel(cfg, hot=False)
+            if fixed.get("changed"):
+                steps.append({"name": "清理残留直连适配器", "ok": True,
+                              "detail": fixed.get("detail") or ""})
+        except Exception as exc:  # noqa: BLE001
+            steps.append({"name": "清理残留直连适配器", "ok": False, "detail": str(exc)})
+
+    if mode == "bridge":
+        healed = await bridge.reregister(cfg)
+        connected = bool(healed.get("ok"))
+        steps.append({"name": "重启中继（重新登记可发送的 bot）", "ok": connected,
+                      "detail": healed.get("detail") or ""})
+    else:
+        from ..supervisor import supervisor as _sup
+
+        await _sup.stop("snowluma")
+        await asyncio.sleep(3.0)
+        await _sup.start("snowluma")
+        steps.append({"name": "重启 SnowLuma", "ok": True, "detail": "已重启并等待重新连接"})
+        connected = False
+        for _ in range(30):
+            await asyncio.sleep(0.5)
+            try:
+                snap = await status()
+                if (snap.get("onebot") or {}).get("clients_connected"):
+                    connected = True
+                    break
+            except Exception:  # noqa: BLE001 - 状态探测失败不影响后续
+                pass
+        steps.append({"name": "OneBot 重新连接", "ok": connected,
+                      "detail": "clients=1" if connected else "30 秒内没连上，看 SnowLuma 日志"})
 
     if not send_test:
-        return {"ok": connected, "steps": steps, "message": "已重启链路" if connected else "链路仍未恢复"}
+        return {"ok": connected, "steps": steps,
+                "message": "已重启链路" if connected else "链路仍未恢复"}
 
     base = f"http://127.0.0.1:{int(cfg.astrbot.webui_port)}"
     raw_admins = cfg.astrbot.admins_id
@@ -345,22 +386,47 @@ async def repair(send_test: bool = Query(default=True)) -> Dict[str, Any]:
     target = admins[0] if admins else str(cfg.snowluma.qq_uin or "")
     if not target:
         return {"ok": False, "steps": steps, "message": "没配管理员 QQ，无法验证发送"}
-    try:
-        jwt = await asyncio.to_thread(astrbot_admin._dashboard_token, base,  # noqa: SLF001
-                                      cfg.astrbot.webui_username or "astrbot",
-                                      cfg.astrbot.webui_password or "")
-        key = await asyncio.to_thread(astrbot_admin.ensure_api_key, base, jwt)
-        sent = await asyncio.to_thread(astrbot_admin.send_im_message, base, key,
-                                       f"snowluma:FriendMessage:{target}",
-                                       f"【SnowLuma 控制台】链路修复验证 {time.strftime('%H:%M:%S')}")
-        steps.append({"name": "发送验证", "ok": bool(sent.get("ok")), "detail": str(sent.get("message"))})
-        ok = bool(sent.get("ok"))
-    except Exception as exc:  # noqa: BLE001
-        steps.append({"name": "发送验证", "ok": False, "detail": str(exc)})
-        ok = False
-    return {"ok": ok, "steps": steps,
-            "message": "发送链路已恢复 ✅（QQ 应该收到一条验证消息）" if ok else "还是发不出去，把这一步的 detail 发我"}
 
+    await asyncio.sleep(1.0)
+
+    sent: Dict[str, Any] = {"ok": False, "message": ""}
+    for attempt in (1, 2):
+        try:
+            jwt = await asyncio.to_thread(astrbot_admin._dashboard_token, base,  # noqa: SLF001
+                                          cfg.astrbot.webui_username or "astrbot",
+                                          cfg.astrbot.webui_password or "")
+            key = await asyncio.to_thread(astrbot_admin.ensure_api_key, base, jwt)
+            suffix = "" if attempt == 1 else "（自愈重试）"
+            sent = await asyncio.to_thread(
+                astrbot_admin.send_im_message, base, key, f"snowluma:FriendMessage:{target}",
+                f"【SnowLuma 控制台】链路修复验证 {time.strftime('%H:%M:%S')}{suffix}")
+        except Exception as exc:  # noqa: BLE001
+            sent = {"ok": False, "message": str(exc)}
+        if sent.get("ok"):
+            break
+        # 第一枪就打空且是「没有可用 bot」→ 再重启一次接入方后重试
+        if attempt == 1 and _looks_like_no_bot(sent.get("message", "")):
+            if mode == "bridge":
+                again = await bridge.reregister(cfg)
+            else:
+                from ..supervisor import supervisor as _sup
+
+                await _sup.restart("snowluma", cfg)
+                again = {"ok": True, "detail": "已重启 SnowLuma"}
+            steps.append({"name": "自愈（重新登记 bot）", "ok": bool(again.get("ok")),
+                          "detail": again.get("detail") or ""})
+            await asyncio.sleep(2.5)
+
+    steps.append({"name": "发送验证", "ok": bool(sent.get("ok")), "detail": str(sent.get("message"))})
+    ok = bool(sent.get("ok"))
+    if ok:
+        message = "发送链路已恢复 ✅（QQ 应该收到一条验证消息）"
+    elif _looks_like_no_bot(sent.get("message", "")):
+        message = ("还是「AstrBot 没有可用 bot」。请关掉其它连到 AstrBot 反向 WS 的客户端"
+                   "（第三方 OneBot 面板、旧版控制台页面）后重试；再不行点「重启全部」。")
+    else:
+        message = "还是发不出去，把这一步的 detail 发我"
+    return {"ok": ok, "steps": steps, "message": message}
 
 @router.post("/selftest")
 async def selftest() -> Dict[str, Any]:
@@ -432,44 +498,46 @@ async def selftest() -> Dict[str, Any]:
         sent = await asyncio.to_thread(astrbot_admin.send_im_message, base, key, umo, text)
     except Exception as exc:  # noqa: BLE001
         sent = {"ok": False, "message": str(exc)}
-    # 发不出去时先自愈一次：重启 SnowLuma 让它的 WS 客户端重新注册成"可发送的 bot"
-    #（aiocqhttp 的 _wsr_api_clients 会因连接更替而丢掉登记，表现为能收不能发）
+    # 发不出去时先自愈一次：让「真正接进 AstrBot 的那一侧」重新登记成可发送的 bot
+    #（aiocqhttp 的 _wsr_api_clients 会因别的同账号连接断开而丢掉登记 → 能收不能发）
     recovered = False
     if not sent.get("ok"):
-        from .. import supervisor as _sup_mod
-
+        cfg_now = get_config()
         try:
-            await _sup_mod.supervisor.stop("snowluma")
-            # 等 AstrBot 侧把旧连接注销（它的 finally 里按 self_id 删登记，
-            # 新旧连接重叠时会误删新连接 → 表现为"能收不能发"）
-            await asyncio.sleep(3.0)
-            await _sup_mod.supervisor.start("snowluma")
-            for _ in range(30):
-                await asyncio.sleep(0.5)
-                try:
-                    snap2 = await status()
-                    if (snap2.get("onebot") or {}).get("clients_connected"):
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
-            await asyncio.sleep(1.5)
-            retry = await asyncio.to_thread(astrbot_admin.send_im_message, base, key, umo, text + "（自愈重试）")
-            if retry.get("ok"):
+            if str(cfg_now.link.mode) == "bridge":
+                healed = await bridge.reregister(cfg_now)
+                recovered = bool(healed.get("ok"))
+            else:
+                from .. import supervisor as _sup_mod
+
+                await _sup_mod.supervisor.stop("snowluma")
+                # 等 AstrBot 侧把旧连接注销（它的 finally 里按 self_id 删登记，
+                # 新旧连接重叠时会误删新连接 → 表现为"能收不能发"）
+                await asyncio.sleep(3.0)
+                await _sup_mod.supervisor.start("snowluma")
                 recovered = True
+            await asyncio.sleep(1.5)
+            retry = await asyncio.to_thread(astrbot_admin.send_im_message, base, key, umo,
+                                            text + "（自愈重试）")
+            if retry.get("ok"):
                 sent = retry
+            else:
+                recovered = False
         except Exception as exc:  # noqa: BLE001
             bus.log("console", f"自检自愈失败（忽略）：{exc}", level="warn")
 
     steps.append({
         "name": "AstrBot → SnowLuma → QQ 发送",
         "ok": bool(sent.get("ok")),
-        "detail": (f"umo={umo} · {sent.get('message')}" + ("（重启 SnowLuma 后恢复正常）" if recovered else "")),
+        "detail": (f"umo={umo} · {sent.get('message')}"
+                   + ("（重新登记 bot 后恢复正常）" if recovered else "")),
     })
     ok = all(s["ok"] for s in steps)
     hint = ""
-    if not sent.get("ok") and "ApiNotAvailable" in str(sent.get("message", "")):
-        hint = ("AstrBot 侧没有可用 bot（Agent 连上了但 bot 没注册）：在「运行」页点『重启全部』，"
-                "顺序是 AstrBot 先就绪、SnowLuma 再连。")
+    if not sent.get("ok") and _looks_like_no_bot(sent.get("message", "")):
+        hint = ("AstrBot 侧没有可用 bot（事件能进、但登记表里没有接入方）：中继模式下"
+                "点「修复发送链路」会重启中继重新登记；别让第二个客户端用同一个 QQ 号"
+                "去连 AstrBot 的反向 WS。")
     elif not ok:
         hint = "看上面哪一步红了就修那一步；面板密码问题用「重置密码」。"
     return {"ok": ok, "steps": steps, "target": target, "umo": umo,

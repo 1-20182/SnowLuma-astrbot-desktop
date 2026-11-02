@@ -1,5 +1,8 @@
 ﻿# 语义化版本号提升：./scripts/bump.ps1 patch|minor|major|x.y.z "更新说明"
-# 会同步 VERSION / desktop\package.json / CHANGELOG.md 顶部条目。
+# 会同步 VERSION / desktop/package.json / CHANGELOG.md 顶部条目。
+# 平台无关说明：路径一律用 Join-Path 逐段拼接，**不要**写成 "desktop\package.json"——
+# 反斜杠只在 Windows 是分隔符，在 Linux/macOS 的 pwsh 7 里是一个普通文件名字符，
+# 会直接变成 "找不到文件：/repo/desktop\package.json"。
 param(
     [Parameter(Mandatory = $true, Position = 0)][string]$Kind,
     [Parameter(Position = 1)][string]$Note = ""
@@ -9,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $VersionFile = Join-Path $Root "VERSION"
 $Changelog = Join-Path $Root "CHANGELOG.md"
-$DesktopPkg = Join-Path $Root "desktop\package.json"
+$DesktopPkg = Join-Path (Join-Path $Root "desktop") "package.json"
 
 $current = (Get-Content $VersionFile -Raw).Trim()
 if ($current -notmatch '^(\d+)\.(\d+)\.(\d+)$') { throw "VERSION 不是 x.y.z：$current" }
@@ -39,9 +42,12 @@ if (Test-Path $Changelog) {
     $text = Get-Content $Changelog -Raw
     $date = Get-Date -Format 'yyyy-MM-dd'
     $entry = "## [$next] - $date`n`n### 变更`n- $Note`n`n"
-    $marker = "## [1.1.0]"
-    if ($text.Contains($marker)) {
-        $text = $text.Replace($marker, $entry + $marker)
+    # 插在"第一条版本标题"之前，保证最新的在最上面。
+    # （旧实现是找固定的 "## [1.1.0]" 当锚点，一旦新版本不再从 1.1.0 往上加，
+    #   条目就会被塞进历史版本中间——顺序错乱比找不到更难查。）
+    $match = [regex]::Match($text, '(?m)^## \[')
+    if ($match.Success) {
+        $text = $text.Insert($match.Index, $entry)
     } else {
         $text = $text.TrimEnd() + "`n`n" + $entry
     }
@@ -49,4 +55,4 @@ if (Test-Path $Changelog) {
 }
 
 Write-Host "版本：$current -> $next" -ForegroundColor Green
-Write-Host "记得：重新打包（packaging\build-exe.bat → desktop\build.bat），发布物会带新版本号。" -ForegroundColor Cyan
+Write-Host "记得：重新打包（Windows: packaging\build-exe.ps1 → desktop\build.ps1；Linux: packaging/build-linux.sh → desktop/build-linux.sh），发布物会带新版本号。" -ForegroundColor Cyan

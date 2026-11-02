@@ -454,6 +454,12 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .checklist .ico.warn { color: #3d2a00; background: var(--warn); }
 .checklist .name { color: var(--text); }
 .checklist .val { margin-left: auto; font-family: var(--mono); font-size: 0.76rem; color: var(--text-faint); text-align: right; word-break: break-all; }
+/* Linux 专属检查项的修复指引（后端 env.checks[].fix）：一条可复制的命令 */
+.checklist li.env-fix { padding-top: 0; border-bottom: 0; }
+.checklist li.env-fix .ico { background: transparent; color: var(--warn); width: 20px; }
+.checklist li.env-fix .name { color: var(--text-faint); font-size: 0.78rem; flex: none; }
+.checklist li.env-fix .val { text-align: left; white-space: pre-wrap; }
+.checklist li.env-fix code { color: var(--text-dim); }
 
 .advice { display: flex; flex-direction: column; gap: 9px; counter-reset: adv; }
 .advice li {

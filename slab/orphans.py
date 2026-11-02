@@ -4,21 +4,22 @@
 它继续占着 6185；下次启动就报「端口 6185 已被占用」，然后整个 AstrBot 起不来。
 
 处理原则：
-* **只清理自己的进程**：exe 或命令行落在 ``runtime\\astrbot`` / ``runtime\\snowluma`` 下面的才算；
+* **只清理自己的进程**：exe 或命令行落在 ``runtime/astrbot`` / ``runtime/snowluma`` 下面的才算
+  （Windows 是反斜杠、Linux 是正斜杠，两种标记都认）；
 * 别人家的程序占端口不碰，只报给用户看；
-* 一律杀整棵进程树（venv 的 python.exe 会再 exec 一个真 python，只杀父进程会留孤儿）。
+* 一律杀整棵进程树（venv 的 python 会再 exec 一个真 python，只杀父进程会留孤儿）。
+  具体怎么杀由 :func:`slab.plat.kill_tree` 决定：Windows 是 ``taskkill /T /F``，
+  Linux 是"进程组 SIGTERM → 超时 SIGKILL"。
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import paths
+from . import paths, plat
 from .events import bus
-from .procutil import hidden_kwargs
 
 
 def _runtime_roots() -> List[Path]:
@@ -43,6 +44,7 @@ def _runtime_roots() -> List[Path]:
 
 
 #: 路径特征：任何以 runtime\astrbot / runtime\snowluma 结尾的路径都算自家进程
+#: （Windows 用反斜杠，POSIX 用正斜杠；比对前两边都会 lowercase）
 _PATH_MARKERS = ("\\runtime\\astrbot", "/runtime/astrbot", "\\runtime\\snowluma", "/runtime/snowluma")
 
 
@@ -60,16 +62,26 @@ def _proc_exe(proc: Any) -> str:
         return ""
 
 
-#: 只有这几种可执行文件可能是我们启的（python / node）
-_OUR_EXE_NAMES = ("python.exe", "pythonw.exe", "node.exe")
+#: 只有这几种可执行文件可能是我们启的（python / node）。
+#: POSIX 上 psutil 给的是 ``python3`` / ``python3.12`` / ``node``，所以用"主干名"比对。
+_OUR_EXE_NAMES = ("python", "python3", "pythonw", "node", "nodejs")
+
+
+def _exe_stem(name: str) -> str:
+    """可执行文件名 → 主干：``python.exe`` / ``python3.12`` → ``python3``。"""
+
+    text = (name or "").strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    text = text.replace(".exe", "")
+    return text.split(".")[0]
 
 
 def is_ours(pid: int) -> bool:
     """这个进程是不是我们装的那两个项目启起来的。
 
     判据（从严，避免误杀别的程序）：
-    1. 可执行文件路径里带 ``\\runtime\\astrbot`` / ``\\runtime\\snowluma``；
-    2. 或者：进程名是 python/node，且 **命令行或工作目录** 落在这两个目录里
+    1. 可执行文件路径里带 ``runtime/astrbot`` / ``runtime/snowluma``；
+    2. 或者：进程名是 python/node（含 ``python3.12`` 这种带版本号的），
+       且 **命令行或工作目录** 落在这两个目录里
        （AstrBot 的 venv python 会再 exec 一个 uv 里的真 python，exe 在 uv 目录下，
         只能靠 ``main.py`` + cwd 认出来）。
     """
@@ -94,30 +106,23 @@ def is_ours(pid: int) -> bool:
 
     if any(marker in exe for marker in _PATH_MARKERS):
         return True
-    if name not in _OUR_EXE_NAMES:
+    if _exe_stem(name) not in _OUR_EXE_NAMES:
         return False
     if any(marker in cmd for marker in _PATH_MARKERS):
         return True
     if any(marker in cwd for marker in _PATH_MARKERS):
         return True
     # venv 的 python 会 exec 到 uv 的 python：命令行里可能只剩 main.py
-    if name.startswith("python") and ("main.py" in cmd or cmd.strip().endswith("main.py")):
+    if _exe_stem(name).startswith("python") and ("main.py" in cmd or cmd.strip().endswith("main.py")):
         for root in _runtime_roots():
             if cwd.startswith(str(root).lower()):
                 return True
     return False
 
 def port_owner(port: int) -> Optional[int]:
-    """拿监听某个端口的 PID（走 ctypes，毫秒级）。"""
+    """拿监听某个端口的 PID（平台差异在 plat：Windows GetExtendedTcpTable / Linux /proc）。"""
 
-    from . import envcheck
-
-    mapping = envcheck._listen_map()  # noqa: SLF001 - 同包内部工具
-    pid = mapping.get(int(port))
-    try:
-        return int(pid) if pid else None
-    except (TypeError, ValueError):
-        return None
+    return plat.port_owner_pid(port)
 
 
 def find_orphans() -> List[Dict[str, Any]]:
@@ -204,18 +209,13 @@ def startup_cleanup() -> Dict[str, Any]:
 
 
 def kill_tree(pid: int) -> bool:
-    if os.name == "nt":
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, timeout=15, **hidden_kwargs())
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-    try:
-        os.kill(pid, 15)
-        return True
-    except OSError:
-        return False
+    """结束整棵进程树（平台差异在 :mod:`slab.plat`）。
+
+    Windows：``taskkill /PID <pid> /T /F``；
+    POSIX：进程组 ``SIGTERM`` → 等待 → ``SIGKILL``（SnowLuma 有优雅关停路径，别一上来就强杀）。
+    """
+
+    return plat.kill_tree(pid, graceful=5.0)
 
 
 def cleanup(dry_run: bool = False) -> Dict[str, Any]:

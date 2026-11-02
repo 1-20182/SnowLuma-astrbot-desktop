@@ -1,7 +1,7 @@
 {
   "name": "snowluma-astrbot-desktop",
   "productName": "SnowLuma AstrBot Console",
-  "version": "1.7.2",
+  "version": "1.8.0",
   "description": "SnowLuma × AstrBot 联合控制台的桌面外壳（Electron）：关窗即退出，不会留下后台进程",
   "main": "main.js",
   "private": true,

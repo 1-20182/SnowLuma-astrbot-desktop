@@ -9,20 +9,26 @@
   - Hook 已知文件夹 / ``GetUserProfileDirectory`` / ``GetUserName``（``FENSHEN_CLONE_HOME`` 等）；
   - 可选：``RegOverridePredefKey`` 重定向 HKCU（``FENSHEN_REG_SUBKEY``，需要先复制注册表快照，默认不用）。
 
+**平台差异**（只在 :mod:`slab.plat` 里判定）：
+* Windows：上面那套 CreateRemoteThread/DLL 注入，逻辑一字未改；
+* Linux/macOS：没有 ``ctypes.wintypes``、也没有可注入的 Win32 API，改成
+  「独立 HOME 分身」——每个 ``clone_id`` 一个 HOME（``$base/qq/clones/<id>/home``），
+  复用 :func:`slab.qq.spawn_posix_isolated`（QQ 的单实例锁在 ``$HOME/.config/QQ``，
+  换 HOME 才能多开）。所以**顶层 import 不能依赖 ctypes.wintypes**。
+
 安全边界：只注入我们自己创建的进程；DLL 来自用户自己的 AppClone 项目。
 """
 
 from __future__ import annotations
 
 import ctypes
-import ctypes.wintypes as wt
 import os
 import struct
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from . import paths
+from . import paths, plat, qq
 from .events import bus
 
 CREATE_SUSPENDED = 0x00000004
@@ -89,6 +95,8 @@ def build_env_block(extra: Dict[str, str]) -> bytes:
 
 def build_clone_env(clone_id: str = "bot", *, device_fake: bool = False,
                     device_name: str = "", taskbar_group: str = "") -> Dict[str, str]:
+    """Windows 深度分身的环境变量（POSIX 用 :func:`slab.qq.posix_isolated_env`）。"""
+
     dirs = clone_dirs(clone_id)
     tag = clone_id.replace("-", "")[:12]
     # 注意：**不要**重定向 USERPROFILE —— 实测（QQ NT 9.9.36）会把启动器直接卡死，
@@ -115,40 +123,8 @@ def build_clone_env(clone_id: str = "bot", *, device_fake: bool = False,
 
 
 # --------------------------------------------------------------------------- #
-# 进程创建 + DLL 注入
+# PE 架构探测（纯文件解析，两个平台都能跑）
 # --------------------------------------------------------------------------- #
-class _STARTUPINFO(ctypes.Structure):
-    _fields_ = [
-        ("cb", wt.DWORD),
-        ("lpReserved", wt.LPWSTR),
-        ("lpDesktop", wt.LPWSTR),
-        ("lpTitle", wt.LPWSTR),
-        ("dwX", wt.DWORD),
-        ("dwY", wt.DWORD),
-        ("dwXSize", wt.DWORD),
-        ("dwYSize", wt.DWORD),
-        ("dwXCountChars", wt.DWORD),
-        ("dwYCountChars", wt.DWORD),
-        ("dwFillAttribute", wt.DWORD),
-        ("dwFlags", wt.DWORD),
-        ("wShowWindow", wt.WORD),
-        ("cbReserved2", wt.WORD),
-        ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
-        ("hStdInput", wt.HANDLE),
-        ("hStdOutput", wt.HANDLE),
-        ("hStdError", wt.HANDLE),
-    ]
-
-
-class _PROCESS_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("hProcess", wt.HANDLE),
-        ("hThread", wt.HANDLE),
-        ("dwProcessId", wt.DWORD),
-        ("dwThreadId", wt.DWORD),
-    ]
-
-
 def _is_64bit_exe(exe: Path) -> bool:
     """读 PE 头判断 64 位（决定注入 inject64 还是 inject32）。"""
 
@@ -166,132 +142,231 @@ def _is_64bit_exe(exe: Path) -> bool:
         return True
 
 
-def _create_suspended(exe: Path, cmdline: str, cwd: Path, env_block: bytes):
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateProcessW.restype = wt.BOOL
-    si = _STARTUPINFO()
-    si.cb = ctypes.sizeof(si)
-    pi = _PROCESS_INFORMATION()
-    env_buf = ctypes.create_string_buffer(env_block, len(env_block))
-    flags = CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT
-    ok = kernel32.CreateProcessW(
-        ctypes.c_wchar_p(str(exe)),
-        ctypes.c_wchar_p(cmdline),
-        None, None, False, flags,
-        ctypes.cast(env_buf, ctypes.c_void_p),
-        ctypes.c_wchar_p(str(cwd)),
-        ctypes.byref(si), ctypes.byref(pi),
-    )
-    if not ok:
-        raise OSError(ctypes.get_last_error(), "CreateProcessW 失败")
-    return kernel32, pi
+# --------------------------------------------------------------------------- #
+# Windows 专属：进程创建 + DLL 注入
+#
+# 这一段是 Windows 的唯一实现，逻辑与 1.7.x 完全一致；
+# 顶层 import 全部放在 ``if plat.IS_WINDOWS`` 里，否则 Linux 上 import 本模块就会
+# 因为 ``ctypes.wintypes`` 不存在而 ImportError。
+# --------------------------------------------------------------------------- #
+if plat.IS_WINDOWS:  # pragma: no branch - 平台常量
+    import ctypes.wintypes as wt
 
+    class _STARTUPINFO(ctypes.Structure):
+        _fields_ = [
+            ("cb", wt.DWORD),
+            ("lpReserved", wt.LPWSTR),
+            ("lpDesktop", wt.LPWSTR),
+            ("lpTitle", wt.LPWSTR),
+            ("dwX", wt.DWORD),
+            ("dwY", wt.DWORD),
+            ("dwXSize", wt.DWORD),
+            ("dwYSize", wt.DWORD),
+            ("dwXCountChars", wt.DWORD),
+            ("dwYCountChars", wt.DWORD),
+            ("dwFillAttribute", wt.DWORD),
+            ("dwFlags", wt.DWORD),
+            ("wShowWindow", wt.WORD),
+            ("cbReserved2", wt.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wt.HANDLE),
+            ("hStdOutput", wt.HANDLE),
+            ("hStdError", wt.HANDLE),
+        ]
 
-def _inject_dll(kernel32, pi: _PROCESS_INFORMATION, dll: Path) -> None:
-    """VirtualAllocEx + WriteProcessMemory(路径) + CreateRemoteThread(LoadLibraryW)。"""
+    class _PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wt.HANDLE),
+            ("hThread", wt.HANDLE),
+            ("dwProcessId", wt.DWORD),
+            ("dwThreadId", wt.DWORD),
+        ]
 
-    k32 = kernel32
-    k32.OpenProcess.restype = wt.HANDLE
-    k32.VirtualAllocEx.restype = ctypes.c_void_p
-    k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
-    k32.WriteProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-                                       ctypes.POINTER(ctypes.c_size_t)]
-    k32.CreateRemoteThread.restype = wt.HANDLE
-    k32.CreateRemoteThread.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
-                                       ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]
-    k32.GetModuleHandleW.restype = ctypes.c_void_p
-    k32.GetProcAddress.restype = ctypes.c_void_p
-    k32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-
-    handle = k32.OpenProcess(PROCESS_ALL_ACCESS, False, pi.dwProcessId)
-    if not handle:
-        raise OSError(ctypes.get_last_error(), "OpenProcess 失败（可能需要管理员权限）")
-    try:
-        dll_bytes = (str(dll) + "\0").encode("utf-16le")
-        remote = k32.VirtualAllocEx(handle, None, len(dll_bytes), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-        if not remote:
-            raise OSError(ctypes.get_last_error(), "VirtualAllocEx 失败")
-        written = ctypes.c_size_t(0)
-        if not k32.WriteProcessMemory(handle, remote, dll_bytes, len(dll_bytes), ctypes.byref(written)):
-            raise OSError(ctypes.get_last_error(), "WriteProcessMemory 失败")
-        load_library = k32.GetProcAddress(k32.GetModuleHandleW("kernel32.dll"), b"LoadLibraryW")
-        if not load_library:
-            raise OSError(ctypes.get_last_error(), "找不到 LoadLibraryW")
-        tid = wt.DWORD(0)
-        thread = k32.CreateRemoteThread(handle, None, 0, load_library, remote, 0, ctypes.byref(tid))
-        if not thread:
-            raise OSError(ctypes.get_last_error(), "CreateRemoteThread 失败（杀软拦截？）")
-        try:
-            k32.WaitForSingleObject(thread, 10000)
-        finally:
-            k32.CloseHandle(thread)
-    finally:
-        k32.CloseHandle(handle)
-
-
-def launch_clone(source_exe: Path, clone_id: str = "bot") -> Dict[str, Any]:
-    """深度分身启动：挂起创建 → 注入 sandbox DLL → 恢复运行。"""
-
-    if os.name != "nt":
-        raise RuntimeError("深度分身只支持 Windows")
-    exe = Path(source_exe)
-    if not exe.is_file():
-        raise FileNotFoundError(f"找不到 QQ.exe：{exe}")
-    is64 = _is_64bit_exe(exe)
-    dll = sandbox_dir() / ("inject64.dll" if is64 else "inject32.dll")
-    if not dll.is_file():
-        raise FileNotFoundError(
-            f"缺少沙箱注入组件：{dll}\n"
-            "请把 AppClone 的 sandbox 目录（inject64.dll / inject32.dll）放到 "
-            f"{sandbox_dir()}，或保留 D:\\fenshen\\dist\\sandbox"
+    def _create_suspended(exe: Path, cmdline: str, cwd: Path, env_block: bytes):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateProcessW.restype = wt.BOOL
+        si = _STARTUPINFO()
+        si.cb = ctypes.sizeof(si)
+        pi = _PROCESS_INFORMATION()
+        env_buf = ctypes.create_string_buffer(env_block, len(env_block))
+        flags = CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT
+        ok = kernel32.CreateProcessW(
+            ctypes.c_wchar_p(str(exe)),
+            ctypes.c_wchar_p(cmdline),
+            None, None, False, flags,
+            ctypes.cast(env_buf, ctypes.c_void_p),
+            ctypes.c_wchar_p(str(cwd)),
+            ctypes.byref(si), ctypes.byref(pi),
         )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "CreateProcessW 失败")
+        return kernel32, pi
 
-    dirs = clone_dirs(clone_id)
-    for key in ("home", "roaming", "local", "local_low", "temp", "user_data"):
-        dirs[key].mkdir(parents=True, exist_ok=True)
+    def _inject_dll(kernel32, pi: "_PROCESS_INFORMATION", dll: Path) -> None:
+        """VirtualAllocEx + WriteProcessMemory(路径) + CreateRemoteThread(LoadLibraryW)。"""
 
-    env = build_clone_env(clone_id)
-    env_block = build_env_block(env)
-    cmdline = f'"{exe}" --user-data-dir="{dirs["user_data"]}"'
+        k32 = kernel32
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.VirtualAllocEx.restype = ctypes.c_void_p
+        k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+        k32.WriteProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                           ctypes.POINTER(ctypes.c_size_t)]
+        k32.CreateRemoteThread.restype = wt.HANDLE
+        k32.CreateRemoteThread.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                           ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+        k32.GetModuleHandleW.restype = ctypes.c_void_p
+        k32.GetProcAddress.restype = ctypes.c_void_p
+        k32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
-    kernel32, pi = _create_suspended(exe, cmdline, exe.parent, env_block)
-    try:
-        _inject_dll(kernel32, pi, dll)
-    except Exception:
-        # 注入失败就别把它挂在那里：直接结束，避免留下一个空进程
+        handle = k32.OpenProcess(PROCESS_ALL_ACCESS, False, pi.dwProcessId)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "OpenProcess 失败（可能需要管理员权限）")
         try:
-            kernel32.TerminateProcess(pi.hProcess, 1)
+            dll_bytes = (str(dll) + "\0").encode("utf-16le")
+            remote = k32.VirtualAllocEx(handle, None, len(dll_bytes), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+            if not remote:
+                raise OSError(ctypes.get_last_error(), "VirtualAllocEx 失败")
+            written = ctypes.c_size_t(0)
+            if not k32.WriteProcessMemory(handle, remote, dll_bytes, len(dll_bytes), ctypes.byref(written)):
+                raise OSError(ctypes.get_last_error(), "WriteProcessMemory 失败")
+            load_library = k32.GetProcAddress(k32.GetModuleHandleW("kernel32.dll"), b"LoadLibraryW")
+            if not load_library:
+                raise OSError(ctypes.get_last_error(), "找不到 LoadLibraryW")
+            tid = wt.DWORD(0)
+            thread = k32.CreateRemoteThread(handle, None, 0, load_library, remote, 0, ctypes.byref(tid))
+            if not thread:
+                raise OSError(ctypes.get_last_error(), "CreateRemoteThread 失败（杀软拦截？）")
+            try:
+                k32.WaitForSingleObject(thread, 10000)
+            finally:
+                k32.CloseHandle(thread)
         finally:
-            kernel32.CloseHandle(pi.hThread)
-            kernel32.CloseHandle(pi.hProcess)
-        raise
-    kernel32.ResumeThread(pi.hThread)
-    kernel32.CloseHandle(pi.hThread)
-    kernel32.CloseHandle(pi.hProcess)
+            k32.CloseHandle(handle)
 
+    def _launch_clone_windows(exe: Path, clone_id: str) -> Dict[str, Any]:
+        is64 = _is_64bit_exe(exe)
+        dll = sandbox_dir() / ("inject64.dll" if is64 else "inject32.dll")
+        if not dll.is_file():
+            raise FileNotFoundError(
+                f"缺少沙箱注入组件：{dll}\n"
+                "请把 AppClone 的 sandbox 目录（inject64.dll / inject32.dll）放到 "
+                f"{sandbox_dir()}，或保留 D:\\fenshen\\dist\\sandbox"
+            )
+
+        dirs = clone_dirs(clone_id)
+        for key in ("home", "roaming", "local", "local_low", "temp", "user_data"):
+            dirs[key].mkdir(parents=True, exist_ok=True)
+
+        env = build_clone_env(clone_id)
+        env_block = build_env_block(env)
+        cmdline = f'"{exe}" --user-data-dir="{dirs["user_data"]}"'
+
+        kernel32, pi = _create_suspended(exe, cmdline, exe.parent, env_block)
+        try:
+            _inject_dll(kernel32, pi, dll)
+        except Exception:
+            # 注入失败就别把它挂在那里：直接结束，避免留下一个空进程
+            try:
+                kernel32.TerminateProcess(pi.hProcess, 1)
+            finally:
+                kernel32.CloseHandle(pi.hThread)
+                kernel32.CloseHandle(pi.hProcess)
+            raise
+        kernel32.ResumeThread(pi.hThread)
+        kernel32.CloseHandle(pi.hThread)
+        kernel32.CloseHandle(pi.hProcess)
+
+        time.sleep(0.6)
+        bus.log("qq", f"深度分身 QQ 已启动：pid={pi.dwProcessId}（clone={clone_id}，"
+                      f"{'x64' if is64 else 'x86'}，数据 {dirs['home']}）", level="info")
+        return {
+            "ok": True,
+            "pid": int(pi.dwProcessId),
+            "clone_id": clone_id,
+            "arch": "x64" if is64 else "x86",
+            "home": str(dirs["home"]),
+            "user_data": str(dirs["user_data"]),
+            "injected": str(dll),
+            "note": "首次启动需要在新窗口里扫码登录机器人号；它与你自己的 QQ 数据完全分开。",
+        }
+
+
+# --------------------------------------------------------------------------- #
+# POSIX 分身：独立 HOME（QQ 单实例锁在 $HOME/.config/QQ/SingletonLock）
+# --------------------------------------------------------------------------- #
+def _launch_clone_posix(exe: Path, clone_id: str) -> Dict[str, Any]:
+    exe = Path(exe)
+    if not exe.is_file():
+        raise FileNotFoundError(
+            f"没有找到 QQ：{exe}\n下一步：" + qq.LINUX_INSTALL_HINT
+        )
+    dirs = clone_dirs(clone_id)
+    for key in ("home", "roaming", "local", "temp", "user_data"):
+        dirs[key].mkdir(parents=True, exist_ok=True)
+    try:
+        proc = qq.spawn_posix_isolated(exe, dirs["home"])
+    except OSError as exc:
+        raise OSError(
+            f"启动分身 QQ 失败：{exc}\n下一步：确认 {exe} 有可执行权限（sudo chmod +x {exe}），"
+            "并在桌面会话里运行控制台（需要 DISPLAY/WAYLAND_DISPLAY）。"
+        ) from exc
     time.sleep(0.6)
-    bus.log("qq", f"深度分身 QQ 已启动：pid={pi.dwProcessId}（clone={clone_id}，{'x64' if is64 else 'x86'}，"
-                  f"数据 {dirs['home']}）", level="info")
+    bus.log("qq", f"HOME 分身 QQ 已启动：pid={proc.pid}（clone={clone_id}，数据 {dirs['home']}）",
+            level="info")
     return {
         "ok": True,
-        "pid": int(pi.dwProcessId),
+        "pid": int(proc.pid),
         "clone_id": clone_id,
-        "arch": "x64" if is64 else "x86",
+        "arch": "arm64" if plat.platform_tag().endswith("arm64") else "x64",
         "home": str(dirs["home"]),
         "user_data": str(dirs["user_data"]),
-        "injected": str(dll),
-        "note": "首次启动需要在新窗口里扫码登录机器人号；它与你自己的 QQ 数据完全分开。",
+        # Linux 没有注入这一步，字段保留是为了让返回结构与 Windows 一致
+        "injected": "",
+        "mode": "home",
+        "note": ("首次启动需要在新窗口里扫码登录机器人号；它用的是独立 HOME"
+                 f"（{dirs['home']}），和你自己的 QQ 数据完全分开。"),
     }
 
 
+def launch_clone(source_exe: Path, clone_id: str = "bot") -> Dict[str, Any]:
+    """分身启动。
+
+    * Windows：挂起创建 → 注入 sandbox DLL → 恢复运行（深度分身）；
+    * Linux：独立 HOME 分身（换 HOME 绕过单实例锁，--no-sandbox 由平台层补）。
+    """
+
+    if plat.IS_WINDOWS:
+        exe = Path(source_exe)
+        if not exe.is_file():
+            raise FileNotFoundError(f"找不到 QQ.exe：{exe}")
+        return _launch_clone_windows(exe, clone_id)
+    return _launch_clone_posix(Path(source_exe), clone_id)
+
+
 def status(clone_id: str = "bot") -> Dict[str, Any]:
+    """分身准备情况（按平台返回）。
+
+    ``sandbox_dir`` / ``sandbox_ready`` 描述的是「安装包里有没有带 Windows 注入组件」，
+    Linux 上不使用它（Linux 走独立 HOME，见 ``mode`` 字段）。
+    """
+
     dirs = clone_dirs(clone_id)
     sandbox = sandbox_dir()
-    return {
+    info: Dict[str, Any] = {
         "ok": True,
         "clone_id": clone_id,
+        "platform": plat.platform_tag(),
+        "mode": "inject" if plat.IS_WINDOWS else "home",
         "sandbox_dir": str(sandbox),
         "sandbox_ready": (sandbox / "inject64.dll").is_file() and (sandbox / "inject32.dll").is_file(),
         "home": str(dirs["home"]),
         "exists": dirs["home"].is_dir(),
     }
+    if plat.IS_WINDOWS:
+        info["note"] = "深度分身：挂起创建 + 注入 sandbox DLL（独立数据目录 / 互斥体改名）"
+    else:
+        info["note"] = (
+            "Linux 没有可注入的 Win32 API，这里用「独立 HOME 分身」实现多开："
+            "每个分身一个 HOME，QQ 的单实例锁各自独立。sandbox_ready 只是包里自带组件的状态。"
+        )
+    return info

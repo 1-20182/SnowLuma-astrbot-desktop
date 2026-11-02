@@ -78,6 +78,10 @@
 * `bridge` 模式下 `snowluma.relay_port`（3001）也参与去重检查；
 * 端口必须是 1–65535 的整数。
 
+「端口 → 占用进程」的平台实现见 §4.5：Windows 是 `GetExtendedTcpTable`（失败退 `netstat`），
+Linux 是 `/proc/net/tcp{,6}` 找 socket inode → 扫 `/proc/<pid>/fd`（`ss -ltnp` 兜底）。
+所以「总览 → 端口占用」在 Linux 上也能显示 `PID 1234 python3`，不需要额外装 `netstat`。
+
 ---
 
 ## 4. 进程模型与生命周期
@@ -94,9 +98,49 @@
 
 * **状态机**：`stopped → starting → running → stopping → stopped`，异常退出记 `failed`。
 * **就绪判定**：端口可连接（可选叠加日志正则），最多等 180 秒。
-* **停止**：Windows 下用 `taskkill /PID <pid> /T /F` 杀掉整棵进程树（QQ 客户端会带子进程）。
+* **停止**：Windows 下用 `taskkill /PID <pid> /T /F` 杀掉整棵进程树（QQ 客户端会带子进程）；
+  POSIX 下以 `start_new_session=True` 起子进程（自成进程组），停止时先对**进程组**发 `SIGTERM`，
+  3 秒后仍存活再 `SIGKILL` —— SnowLuma 有优雅关停路径，强杀会丢 OneBot 收尾。两套实现都在 `slab/plat.py`。
 * **日志**：子进程 stdout/stderr 逐行 → 推入 EventBus → 落盘 `data/logs/<service>.log`。
 * **退出**：控制台关闭时会 `stop_all()`，把自己拉起来的服务一起停掉（不会留下孤儿进程）。
+
+---
+
+## 4.5 平台层（`slab/plat.py`）
+
+平台差异**只允许**出现在 `slab/plat.py`，其它模块 import 它的函数，不许自己写 `if os.name == "nt"`。
+
+```
+plat.py
+├─ 标识      platform_tag() / exe_suffix() / node_bin_name() / venv_python() / uid()
+├─ 子进程    hidden_kwargs()（不弹窗）/ detached_kwargs()（独立进程组）
+├─ 进程      kill_tree() / process_alive()
+├─ 端口      listen_map() / port_owner_text()
+│             Windows: GetExtendedTcpTable → netstat 兜底
+│             Linux  : /proc/net/tcp{,6} → socket inode → /proc/<pid>/fd → ss 兜底
+├─ 文件/桌面 chmod_exec() / open_path() / desktop_dirs()
+├─ 存储      default_storage_base()（Windows=None 走盘符枚举；POSIX=XDG）
+├─ QQ        qq_install_dirs() / qq_exe_names() / qq_process_names()（/opt/QQ vs 注册表）
+└─ 注入自检  ptrace_scope() / binary_has_cap_ptrace() / qq_injection_readiness()
+```
+
+两条硬规则：
+
+1. **Windows 行为一个字都不许变**（现有测试与线上版本都钉着它），Windows 分支是原逻辑搬运；
+2. 拿不到信息就**退化**，不要抛：端口表读不到返回空 dict，`/proc` 不可读返回空，`ss` 不存在跳过。
+
+平台信息如何到前端：`envcheck.env_report()` 在报告里带 `is_windows` / `is_linux` / `tag` / `os` / `platform`，
+Linux 上另加 `linux` 子对象（`ptrace_scope`、`display`、`node_cap_ptrace`、`venv_ok`…）与
+`checks[]`（逐项 `label/ok/value/fix`）。前端**只读这些字段**判断平台并渲染文案，不猜系统。
+
+Linux 注入链路与 Windows 的差异（详见 [LINUX.md](LINUX.md)）：
+
+| | Windows | Linux |
+| --- | --- | --- |
+| 注入方式 | DLL 注入（sandbox 组件） | **ptrace 附着** |
+| 前置条件 | 与 QQ 同用户、同权限级别 | node 有 `cap_sys_ptrace` + Yama `ptrace_scope` ≤ 2 + 与 QQ **同 uid** |
+| 多开 | 深度分身（互斥体改名 + 文件夹重定向） | **独立 HOME**（单实例锁在 `$HOME/.config/QQ/SingletonLock`） |
+| 扫码 | QQ 客户端窗口 | QQ 客户端窗口（需要 X11 / XWayland，即 `DISPLAY` 非空） |
 
 ---
 
@@ -227,9 +271,10 @@ SSE 事件类型：
 ① 控制台打不开      → 8790 端口 / python 进程 / 依赖
 ② 服务起不来        → 是否已安装？端口被占？看「运行」页该服务日志
 ③ SnowLuma 没登录   → 打开 5099 面板扫码；看 SnowLuma 日志有没有 login 字样
+                      （Linux 上先过「平台前置」：cap_sys_ptrace / ptrace_scope / DISPLAY）
 ④ OneBot 没连上     → 6199 是否监听；两侧 token 是否一致（重新「写入联动配置」）
 ⑤ 消息不回复        → AstrBot 日志：是否收到事件？API Key / 模型名 / 触发规则
 ⑥ 回复太慢/超时     → 大模型接口连通性、`behavior.reply_timeout`
 ```
 
-具体处方见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
+具体处方见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)；Linux 专有三类故障见其中第 16、17、18 条。

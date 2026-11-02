@@ -2,7 +2,10 @@
 
 * 所有服务都用同一套状态机：stopped → starting → running → stopping → stopped
 * 就绪条件二选一：端口可连接 + 日志正则（两者都配则都要满足）
-* Windows 下用 ``taskkill /T /F`` 杀掉整棵进程树（QQ 客户端会带子进程）
+* 结束整棵进程树统一走 :func:`slab.plat.kill_tree`：Windows 是 ``taskkill /T /F``，
+  Linux 是"进程组 SIGTERM → 超时 SIGKILL"（QQ 客户端 / AstrBot 都会带子进程）
+* 长驻子进程用 :func:`slab.plat.service_spawn_kwargs` 起：Windows 隐藏控制台，
+  POSIX ``start_new_session``（独立进程组，关窗/退出能一次收掉整棵树）
 * 子进程日志逐行推入 EventBus，同时落盘到 data/logs/<service>.log
 """
 
@@ -21,10 +24,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .config import AppConfig, get_config
 from .events import bus
-from .procutil import hidden_console_kwargs, hidden_kwargs
-from . import paths
-
-IS_WINDOWS = os.name == "nt"
+from . import paths, plat
 
 
 # --------------------------------------------------------------------------- #
@@ -218,8 +218,9 @@ class Supervisor:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            # 关键：长驻服务用一个"隐藏的"控制台，既不弹黑框，孙进程也不会各自新开窗
-            **hidden_console_kwargs(),
+            # 关键：长驻服务用"隐藏的"控制台 / POSIX 独立进程组，
+            # 既不弹黑框、孙进程也不会各自新开窗，退出时还能按组收掉整棵树
+            **plat.service_spawn_kwargs(),
         )
         st.pid = proc.pid
         self._procs[d.name] = proc
@@ -338,6 +339,11 @@ class Supervisor:
             try:
                 proc.wait(timeout=timeout or d.stop_timeout)
             except subprocess.TimeoutExpired:
+                # 还赖着不走：跳过 SIGTERM 直接对整组 SIGKILL（POSIX），再兜底杀直接子进程
+                try:
+                    plat.kill_tree(proc.pid, force=True)
+                except Exception:  # noqa: BLE001 - 兜底失败也要往下走
+                    pass
                 proc.kill()
                 try:
                     proc.wait(timeout=5)
@@ -363,12 +369,10 @@ class Supervisor:
         return pids
 
     def _kill_tree(self, pid: int) -> None:
+        """结束整棵进程树（平台差异在 plat 里：taskkill / 进程组 SIGTERM→SIGKILL）。"""
+
         try:
-            if IS_WINDOWS:
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                               capture_output=True, timeout=20, **hidden_kwargs())
-            else:
-                os.kill(pid, 15)
+            plat.kill_tree(pid, graceful=3.0)
         except Exception as exc:  # noqa: BLE001
             bus.log("console", f"结束进程 {pid} 失败: {exc}", level="warn")
 
@@ -386,11 +390,15 @@ class Supervisor:
                 pass
 
     async def start_all(self, cfg: Optional[AppConfig] = None, *, wait_ready: float = 45.0) -> Dict[str, str]:
-        """按顺序启动：AstrBot → SnowLuma → 中继。
+        """按顺序启动：AstrBot → SnowLuma → 中继（第二次启动就点这一个按钮）。
 
-        顺序很重要：AstrBot 的 aiocqhttp 反向 WS 要先就绪，SnowLuma 作为 WS 客户端连上去
-        才会注册成"可双向收发"的 bot；反过来（SnowLuma 先连上、AstrBot 后起）容易出现
-        "能收到消息但发不回去"（aiocqhttp.ApiNotAvailable）。
+        顺序很重要：AstrBot 的 aiocqhttp 反向 WS 要先就绪，接入方再去连它才不会出现
+        「能收到消息但发不回去」（aiocqhttp.ApiNotAvailable）。接入方按模式不同：
+
+        * bridge 模式：中继（``bridge``）→ 所以最后起中继，并等它真正连上 AstrBot；
+        * native 模式：SnowLuma 自己 → 由 SnowLuma 连 6199。
+
+        反过来（接入方先连、AstrBot 后起）容易出现反向 WS 握手被拒 / 登记错乱。
         """
 
         cfg = cfg or get_config()
@@ -406,7 +414,7 @@ class Supervisor:
             except Exception as exc:  # noqa: BLE001
                 result[name] = f"failed: {exc}"
                 continue
-            # AstrBot 起来了再等它就绪（ready 后才开始监听 6199），再拉 SnowLuma
+            # AstrBot 起来了再等它就绪（ready 后才开始监听 6199），再拉接入方
             if name == "astrbot" and d.kind == "process":
                 deadline = time.time() + max(5.0, wait_ready)
                 while time.time() < deadline:
@@ -415,6 +423,20 @@ class Supervisor:
                         break
                     await asyncio.sleep(0.4)
                 result["astrbot_wait"] = "ready" if self.state("astrbot").ready else "timeout"
+            # 中继是 task：start() 只是把任务拉起来，真正的连接是异步的。
+            # 等它连上再返回，界面/自检才不用"再点一次刷新碰运气"。
+            elif name == "bridge" and d.kind == "task" and str(cfg.link.mode) == "bridge":
+                from . import bridge as bridge_mod  # 延迟导入，避免模块级循环依赖
+
+                deadline = time.time() + max(5.0, wait_ready)
+                while time.time() < deadline:
+                    live = bridge_mod._bridge  # noqa: SLF001 - 同一进程内读实时状态
+                    if live is not None and live.upstream.connected and live.downstream.connected:
+                        break
+                    await asyncio.sleep(0.4)
+                live = bridge_mod._bridge  # noqa: SLF001
+                ok = bool(live is not None and live.upstream.connected and live.downstream.connected)
+                result["bridge_wait"] = "connected" if ok else "timeout"
         return result
 
 

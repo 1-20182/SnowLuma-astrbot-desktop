@@ -1,0 +1,19 @@
+# 换行符与二进制类型（Windows 上 core.autocrlf=true 时的安全网）
+#
+# 背景：Windows 检出默认把文本转成 CRLF。shell 脚本一旦带上 \r，Linux 上
+# 会直接 `bad interpreter: /usr/bin/env bash^M`；.desktop 也一样解析失败。
+# 所以对 Linux 侧要执行的脚本强制 LF，对 Windows 侧脚本强制 CRLF。
+
+*.sh        text eol=lf
+*.desktop   text eol=lf
+*.service   text eol=lf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# 二进制（避免被当文本转换而损坏）
+*.ico       binary
+*.png       binary
+*.zip       binary
+*.gz        binary
+*.exe       binary

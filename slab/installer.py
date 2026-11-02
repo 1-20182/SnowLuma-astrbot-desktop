@@ -42,7 +42,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import paths
+from . import paths, plat
 from .config import AppConfig, get_config
 from .events import bus
 from .procutil import hidden_kwargs
@@ -86,12 +86,14 @@ SNOWLUMA_ENTRY = "index.mjs"
 SNOWLUMA_READY_RE = r"\[WebUI\] listening http://"
 # uvicorn 监听行（剥离 ANSI 后匹配）；aiocqhttp 1.4.4 不会打印「适配器已连接」
 ASTRBOT_READY_RE = r"Running on http://"
-EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+#: 可执行文件后缀（Windows ``.exe``，POSIX 空串）——平台差异统一取自 :mod:`slab.plat`
+EXE_SUFFIX = plat.exe_suffix()
 
 NODE_REQUIRED = "^24.22.1 || >=26.12.1"
 ASTRBOT_MIN_PYTHON = (3, 12)  # pyproject requires-python >= 3.12
 ASTRBOT_PREFERRED_PYTHON = "3.12"
 PYTHON_DOWNLOAD_URL = "https://www.python.org/downloads/"
+UV_INSTALL_URL = "https://docs.astral.sh/uv/"
 
 FALLBACK_SNOWLUMA_TAGS = ["v2.2.1"]
 DEFAULT_SNOWLUMA_RUNTIME_CONFIG: Dict[str, Any] = {
@@ -114,10 +116,30 @@ ASTRBOT_DASHBOARD_NOTE = (
 _GIT_HINT = (
     "请安装 Git for Windows（https://git-scm.com/download/win）后重开控制台；"
     "或保持网络可用，控制台会自动改用源码压缩包（zipball）安装。"
+    if plat.IS_WINDOWS
+    else "请先安装 git（Ubuntu/Debian：sudo apt install -y git）后重开控制台；"
+    "或保持网络可用，控制台会自动改用源码压缩包（zipball）安装。"
 )
 
-# SnowLuma 官方发行目标（release.yml 矩阵）→ 资产名后缀
-_TARGET_SUFFIX = {"win32-x64": "win-x64", "linux-x64": "linux-x64", "linux-arm64": "linux-arm64"}
+#: 安装目录示例（报错文案里给用户照着填）
+INSTALL_DIR_EXAMPLE = r"D:\SnowLuma" if plat.IS_WINDOWS else "/opt/SnowLuma"
+
+# SnowLuma 官方发行目标（release.yml 矩阵）→ 资产名后缀。
+# 键是 release.json 里的 ``target``（= Node 的 ``process.platform-process.arch``）：
+# Windows 是 ``win32-x64``、Linux 是 ``linux-x64`` / ``linux-arm64``；
+# 同时接受 ``win-x64`` 这种写法（1.x 的旧包与手工改过的清单里出现过）。
+_TARGET_SUFFIX = {
+    "win32-x64": "win-x64",
+    "win-x64": "win-x64",
+    "win32-arm64": "win-arm64",
+    "win-arm64": "win-arm64",
+    "linux-x64": "linux-x64",
+    "linux-arm64": "linux-arm64",
+}
+
+#: 各发行目标对应的压缩包格式（Windows 官方只发 zip，Linux 只发 tar.gz）
+_TARGET_EXT = {"win-x64": ".zip", "win-arm64": ".zip",
+               "linux-x64": ".tar.gz", "linux-arm64": ".tar.gz"}
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +265,7 @@ def _reject_traversal(raw: str, label: str) -> None:
     normalized = text.replace("\\", "/")
     if any(part == ".." for part in normalized.split("/")):
         raise DeployError(
-            f"{label}路径不能包含「..」({raw})。请在设置里填写完整的绝对路径，例如 D:\\SnowLuma。"
+            f"{label}路径不能包含「..」({raw})。请在设置里填写完整的绝对路径，例如 {INSTALL_DIR_EXAMPLE}。"
         )
 
 
@@ -275,13 +297,15 @@ def _assert_allowed_root(p: Path, label: str) -> None:
             return
     if p.parent == p:
         raise DeployError(
-            f"{label}安装目录不能是磁盘根目录（{p}）。请选择一个子目录，例如 D:\\SnowLuma。"
+            f"{label}安装目录不能是磁盘根目录（{p}）。请选择一个子目录，例如 {INSTALL_DIR_EXAMPLE}。"
         )
-    low = str(p).lower()
-    system_like = ("\\windows", "\\system32", "\\program files", "/bin", "/etc", "/usr", "/sys", "/boot")
+    low = str(p).lower().replace("\\", "/")
+    # Windows：\windows、\system32、\program files；POSIX：/bin、/etc、/usr、/sys、/boot、/lib
+    system_like = ("/windows", "/system32", "/program files",
+                   "/bin", "/sbin", "/etc", "/usr", "/sys", "/boot", "/lib")
     if any(seg in low for seg in system_like):
         raise DeployError(
-            f"{label}安装目录不能是系统目录（{p}）。请改到普通数据盘目录，例如 D:\\SnowLuma。"
+            f"{label}安装目录不能是系统目录（{p}）。请改到普通数据目录，例如 {INSTALL_DIR_EXAMPLE}。"
         )
 
 
@@ -295,7 +319,7 @@ def resolve_install_dir(raw: str, default_dir: Path, label: str) -> Path:
         if not p.is_absolute():
             raise DeployError(
                 f"{label}安装目录必须填绝对路径（当前填的是「{text}」）。"
-                "请打开「设置」改成例如 D:\\SnowLuma，或留空使用默认的 runtime 目录。"
+                f"请打开「设置」改成例如 {INSTALL_DIR_EXAMPLE}，或留空使用默认的 runtime 目录。"
             )
     else:
         p = Path(default_dir)
@@ -410,16 +434,14 @@ class CmdResult:
 
 
 def _kill_proc(proc: "subprocess.Popen[str]") -> None:
+    """结束一个超时的子进程（Windows: taskkill /T /F；POSIX: 进程组信号 + kill）。"""
+
     try:
-        if os.name == "nt":
-            subprocess.run(  # noqa: S603
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=20,
-                **hidden_kwargs(),
-            )
-        else:  # pragma: no cover - 本项目面向 Windows
-            proc.kill()
+        plat.kill_tree(proc.pid, graceful=0)
     except Exception:  # noqa: BLE001
-        with contextlib.suppress(Exception):
+        pass
+    with contextlib.suppress(Exception):
+        if proc.poll() is None:
             proc.kill()
 
 
@@ -537,12 +559,68 @@ def _git(args: List[str], cwd: Optional[Path] = None, timeout: float = 60) -> st
 # --------------------------------------------------------------------------- #
 # 环境探测
 # --------------------------------------------------------------------------- #
+def _target_from(platform_name: str, arch: str) -> str:
+    """把「平台名 + 架构」翻译成 SnowLuma 的发行目标名（``win32-x64`` 这种）。
+
+    ``platform_name`` 是 ``sys.platform`` 风格（``win32`` / ``linux`` / ``darwin``）。
+    """
+
+    arch = (arch or "").lower()
+    amd64 = arch in ("x86_64", "amd64", "x64", "x86-64")
+    arm64 = arch in ("arm64", "aarch64")
+    if platform_name.startswith("win") or platform_name == "nt":
+        if amd64:
+            return "win32-x64"
+        if arm64:
+            raise DeployError(
+                "SnowLuma 官方暂未发布 Windows ARM64 版（当前架构 "
+                f"{arch}）。下一步：换用 x64 的 Windows 电脑，或改用 SnowLuma 源码自行构建。"
+            )
+    if platform_name.startswith("linux"):
+        if amd64:
+            return "linux-x64"
+        if arm64:
+            return "linux-arm64"
+    if platform_name.startswith("darwin") or platform_name.startswith("mac"):
+        raise DeployError(
+            "SnowLuma 官方发行包目前只提供 Windows x64 / Linux x64 / Linux arm64"
+            "（macOS 暂无官方构建，插件与原生模块也不支持）。"
+            "下一步：请在 Windows 或 Linux 电脑上部署本控制台，或自行从源码构建 SnowLuma。"
+        )
+    raise DeployError(
+        f"当前系统 {platform_name or '未知'}/{arch or '未知'} 没有 SnowLuma 官方发行包。"
+        "下一步：请在 Windows x64 或 Linux x64/arm64 上部署。"
+    )
+
+
 def detect_snowluma_target(
     sys_platform: Optional[str] = None, machine: Optional[str] = None
 ) -> str:
-    """返回 SnowLuma 发行目标（``win32-x64`` / ``linux-x64`` / ``linux-arm64``）。"""
+    """返回 SnowLuma 发行目标（``win32-x64`` / ``linux-x64`` / ``linux-arm64``）。
 
-    plat = (sys_platform or sys.platform or "").lower()
+    不传参数时走 :func:`slab.plat.platform_tag`（平台差异只在 plat.py 里判定）；
+    显式传 ``sys_platform`` / ``machine`` 时按参数判定（测试与离线包校验用）。
+    """
+
+    if sys_platform is None and machine is None:
+        tag = plat.platform_tag()  # win-x64 / win-arm64 / linux-x64 / linux-arm64 / darwin-*
+        if tag == "win-x64":
+            return "win32-x64"
+        if tag == "win-arm64":
+            return _target_from("win32", "arm64")  # 抛「未发布 ARM64」的中文错误
+        if tag in ("linux-x64", "linux-arm64"):
+            return tag
+        return _target_from(tag.split("-")[0], tag.split("-", 1)[1] if "-" in tag else "")
+
+    # 只给了 machine 没给平台时，平台名也取自平台层（不在这里读 sys.platform）
+    if sys_platform is None:
+        if plat.IS_WINDOWS:
+            sys_platform = "win32"
+        elif plat.IS_LINUX:
+            sys_platform = "linux"
+        else:  # macOS / 其它：platform_tag() 形如 "darwin-arm64"
+            sys_platform = plat.platform_tag().split("-")[0]
+    platform_name = (sys_platform or "").lower()
     arch = (machine or os.environ.get("PROCESSOR_ARCHITECTURE") or "").lower()
     if not arch or arch in ("x86",):
         try:
@@ -551,31 +629,14 @@ def detect_snowluma_target(
             arch = _platform.machine().lower()
         except Exception:  # noqa: BLE001  # pragma: no cover
             arch = "x86_64"
-    amd64 = arch in ("x86_64", "amd64", "x64", "x86-64")
-    arm64 = arch in ("arm64", "aarch64")
-    if plat.startswith("win") or plat == "nt":
-        if amd64:
-            return "win32-x64"
-        if arm64:
-            raise DeployError(
-                "SnowLuma 官方暂未发布 Windows ARM64 版（当前架构 "
-                f"{arch}）。下一步：换用 x64 的 Windows 电脑，或改用 SnowLuma 源码自行构建。"
-            )
-    if plat.startswith("linux"):
-        if amd64:
-            return "linux-x64"
-        if arm64:
-            return "linux-arm64"
-    if plat.startswith("darwin") or plat.startswith("mac"):
-        raise DeployError(
-            "SnowLuma 官方发行包目前只提供 Windows x64 / Linux x64 / Linux arm64"
-            "（macOS 暂无官方构建，插件与原生模块也不支持）。"
-            "下一步：请在 Windows 电脑上部署本控制台，或自行从源码构建 SnowLuma。"
-        )
-    raise DeployError(
-        f"当前系统 {plat or '未知'}/{arch or '未知'} 没有 SnowLuma 官方发行包。"
-        "下一步：请在 Windows x64 或 Linux x64/arm64 上部署。"
-    )
+    return _target_from(platform_name, arch)
+
+
+def snowluma_asset_ext(target: Optional[str] = None) -> str:
+    """发行包扩展名：Windows 是 ``.zip``，Linux 是 ``.tar.gz``。"""
+
+    tgt = target or detect_snowluma_target()
+    return _TARGET_EXT.get(_TARGET_SUFFIX.get(tgt, ""), ".zip")
 
 
 def snowluma_asset_name(
@@ -601,7 +662,7 @@ def snowluma_asset_name(
     if not tag:
         raise DeployError("请先指定 SnowLuma 版本（latest 或 v2.2.1 这样的 tag）。")
     suffix = _TARGET_SUFFIX[tgt]
-    ext = ".zip" if tgt.startswith("win32") else ".tar.gz"
+    ext = _TARGET_EXT[suffix]
     lite = "-lite" if str(edition or "full").strip().lower() == "lite" else ""
     return f"SnowLuma-{tag}-{suffix}{lite}{ext}"
 
@@ -857,6 +918,28 @@ def _single_root(dest: Path) -> Path:
     return dest
 
 
+def _chmod_binaries(root: Path) -> List[str]:
+    """给发行包里的可执行文件补上 ``+x``（POSIX；Windows 是空操作）。
+
+    tar.gz 一般保留权限位，但「离线安装」常常是别人从 Windows 转存/解压再打包一遍的
+    zip（Windows 没有权限位），解出来 node / launcher.sh 会不可执行，启动时只报
+    ``Permission denied``。这里兜底 chmod 一次，失败不致命。
+    """
+
+    if plat.IS_WINDOWS:
+        return []
+    fixed: List[str] = []
+    candidates = [root / plat.node_bin_name(), root / "launcher.sh"]
+    for pattern in ("*.sh", "bin/*"):
+        candidates.extend(sorted(root.glob(pattern)))
+    for item in candidates:
+        if not item.is_file():
+            continue
+        plat.chmod_exec(item)
+        fixed.append(item.name)
+    return fixed
+
+
 def extract_archive(archive: Path, dest: Path) -> Path:
     """解压到 ``dest``（调用方负责 dest 是新建的临时目录），返回实际根目录。"""
 
@@ -881,7 +964,9 @@ def extract_archive(archive: Path, dest: Path) -> Path:
                 tf.extractall(dest, filter="data")  # Python 3.12+
             except TypeError:  # pragma: no cover - 旧版本 Python 兜底
                 tf.extractall(dest)
-    return _single_root(dest)
+    root = _single_root(dest)
+    _chmod_binaries(root)
+    return root
 
 
 def archive_release_info(archive: Path) -> Dict[str, Any]:
@@ -1013,7 +1098,7 @@ def installed_snowluma(cfg: Optional[AppConfig] = None) -> Dict[str, Any]:
     release = _read_json(home / "release.json") or {}
     package = _read_json(home / "package.json") or {}
     version = str(release.get("version") or package.get("version") or "").strip()
-    node_exe = home / f"node{EXE_SUFFIX}"
+    node_exe = home / plat.node_bin_name()
     entry = (home / SNOWLUMA_ENTRY).is_file()
     has_node = node_exe.is_file()
     runtime_port = detect_snowluma_port(cfg) if home.is_dir() else None
@@ -1040,7 +1125,8 @@ def astrbot_python(cfg: Optional[AppConfig] = None) -> Path:
         _reject_traversal(custom, "AstrBot Python ")
         return Path(custom).expanduser().resolve()
     home = astrbot_dir(cfg)
-    return home / ".venv" / ("Scripts" if os.name == "nt" else "bin") / f"python{EXE_SUFFIX}"
+    # Windows: .venv/Scripts/python.exe；Linux/macOS: .venv/bin/python（平台层统一）
+    return plat.venv_python(home)
 
 
 def installed_astrbot(cfg: Optional[AppConfig] = None) -> Dict[str, Any]:
@@ -1384,10 +1470,11 @@ def check_node_version(install_dir: Optional[Path] = None, node: Optional[str] =
     """lite 版启动/安装前的 Node 预检（与包内 check-node-version.cjs 判定一致）。"""
 
     node_exe = node or _which("node")
+    node_name = plat.node_bin_name()
     if not node_exe:
         raise DeployError(
             "未找到 Node.js，无法运行 SnowLuma lite 版（lite 不带内置 Node）。\n"
-            f"下一步：1) 改用 full 版（自带 node.exe，无需安装 Node）；2) 或安装 Node.js "
+            f"下一步：1) 改用 full 版（自带 {node_name}，无需安装 Node）；2) 或安装 Node.js "
             f"{NODE_REQUIRED} 后重启控制台。"
         )
     version = node_version(node_exe)
@@ -1398,24 +1485,50 @@ def check_node_version(install_dir: Optional[Path] = None, node: Optional[str] =
             raise DeployError(
                 f"SnowLuma 自检脚本报告 Node.js 版本不受支持（当前 {version or '未知'}，"
                 f"要求 {NODE_REQUIRED}）。\n"
-                f"下一步：1) 改用 full 版（自带 node.exe）；2) 或把 Node.js 升级到 24.22.1+ / 26.12.1+。\n"
+                f"下一步：1) 改用 full 版（自带 {node_name}）；2) 或把 Node.js 升级到 24.22.1+ / 26.12.1+。\n"
                 f"自检输出：{result.tail(3)}"
             )
         return version
     if not node_version_supported(version):
         raise DeployError(
             f"当前 Node.js 版本 {version or '未知'} 不受支持：要求 {NODE_REQUIRED}。\n"
-            "下一步：1) 改用 full 版（自带 node.exe，推荐小白使用）；2) 或升级 Node.js 后重试。"
+            f"下一步：1) 改用 full 版（自带 {node_name}，推荐小白使用）；2) 或升级 Node.js 后重试。"
         )
     return version
 
 
 def _base_python() -> str:
-    for name in ("python", "python3"):
+    """挑一个「拿它建 venv 就行」的基础 Python。
+
+    Linux 发行版的 ``python3`` 可能是 3.10（Ubuntu 22.04），所以 POSIX 上**先按版本号找**
+    ``python3.12`` / ``python3.13``…，再退回 ``python3`` / ``python``；Windows 老样子。
+    """
+
+    names = ("python", "python3") if plat.IS_WINDOWS else (
+        "python3.12", "python3.13", "python3.14", "python3", "python",
+    )
+    for name in names:
         exe = _which(name)
         if exe:
             return exe
     return sys.executable
+
+
+def _python_install_hint() -> str:
+    """「怎么搞到 Python 3.12」的可执行建议（按平台给命令）。"""
+
+    if plat.IS_WINDOWS:
+        return (
+            f"从 {PYTHON_DOWNLOAD_URL} 安装 Python 3.12+（安装时勾选 Add to PATH），"
+            f"或安装 uv（{UV_INSTALL_URL}）后重启控制台重试。"
+        )
+    return (
+        "安装 Python 3.12（Ubuntu 24.04 自带 python3.12；Ubuntu 22.04 需要先加源）：\n"
+        "    sudo apt update && sudo apt install -y python3.12 python3.12-venv python3.12-dev\n"
+        "    # Ubuntu 22.04 若提示找不到包：sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt update\n"
+        f"或者安装 uv（它会自动下载 Python 3.12）：curl -LsSf https://astral.sh/uv/install.sh | sh\n"
+        f"（也可以从 {PYTHON_DOWNLOAD_URL} 源码/安装包自己装）；装好后重启控制台重试。"
+    )
 
 
 def python_report() -> Dict[str, Any]:
@@ -1438,8 +1551,7 @@ def python_report() -> Dict[str, Any]:
         info["message"] = (
             f"系统 Python 版本过低（{info['version'] or '未知'}，AstrBot 需要 "
             f"{info['min_version']}+），并且未检测到 uv。\n"
-            f"下一步：从 {PYTHON_DOWNLOAD_URL} 安装 Python 3.12+（勾选 Add to PATH），"
-            "或安装 uv（https://docs.astral.sh/uv/ ）后重启控制台重试。"
+            f"下一步：{_python_install_hint()}"
         )
     return info
 
@@ -1494,12 +1606,24 @@ def _dir_size(path: Path) -> int:
 
 
 def _remove_dir(path: Path, label: str) -> None:
+    """删除目录（兼容 POSIX 上的只读文件/目录，例如 git 的 objects）。"""
+
+    def _retry(func: Any, target: Any, _exc: Any = None) -> None:
+        # 只读目录/文件（git objects 常常是 r-x）先放宽权限再删
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o700)
+            func(target)
+
     try:
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path, onexc=_retry)  # Python 3.12+
+        except TypeError:  # pragma: no cover - 老版本 Python 兜底
+            shutil.rmtree(path, onerror=lambda f, p, e: _retry(f, p, e))
     except OSError as exc:
         raise DeployError(
             f"{label}目录无法删除：{path}（{exc}）。\n"
-            "下一步：先停掉对应服务、关掉占用文件的程序，然后重试；也可以手动删除该目录。"
+            "下一步：先停掉对应服务、关掉占用文件的程序，然后重试；也可以手动删除该目录"
+            + ("" if plat.IS_WINDOWS else "（例如：sudo rm -rf " + str(path) + "）") + "。"
         ) from exc
 
 
@@ -1716,9 +1840,15 @@ def deploy_snowluma(
             hint = ""
             if meta_target:
                 hint = f"\n（这个包的目标平台是 {meta_target}，当前系统是 {target or '未知'}）"
+            # 给用户一个「本机该下哪个包」的示例（拿不到 target 时按平台给字面量）
+            example = ("SnowLuma-v2.2.1-linux-x64.tar.gz" if plat.IS_LINUX
+                       else "SnowLuma-v2.2.1-win-x64.zip")
+            if target:
+                with contextlib.suppress(DeployError):
+                    example = snowluma_asset_name(tag or "v2.2.1", want_edition, target=target)
             raise DeployError(
                 f"压缩包内容异常：解压后没有找到 {SNOWLUMA_ENTRY}。{hint}\n"
-                "下一步：确认下载的是 SnowLuma 官方发行包（文件名形如 SnowLuma-v2.2.1-win-x64.zip），"
+                f"下一步：确认下载的是 SnowLuma 官方发行包（文件名形如 {example}），"
                 "而不是源码包；或重新下载后再试。"
             )
 
@@ -1741,17 +1871,17 @@ def deploy_snowluma(
             shutil.rmtree(staging, ignore_errors=True)
 
     version_value = str((_read_json(target_dir / "release.json") or {}).get("version") or tag.lstrip("v"))
-    node_exe = target_dir / f"node{EXE_SUFFIX}"
+    node_exe = target_dir / plat.node_bin_name()
     pr(
         "done",
         1.0,
         f"SnowLuma {version_value}（{want_edition} 版）安装完成：{target_dir}",
     )
-    if target_dir.is_dir() and not (target_dir / f"node{EXE_SUFFIX}").is_file():
+    if target_dir.is_dir() and not node_exe.is_file():
         pr(
             "done",
             1.0,
-            "注意：安装目录里没有内置 node.exe，启动时会使用系统 Node.js。"
+            f"注意：安装目录里没有内置 {plat.node_bin_name()}，启动时会使用系统 Node.js。"
             f"（要求 {NODE_REQUIRED}）",
             level="warn",
         )
@@ -1883,7 +2013,11 @@ def _install_astrbot_zipball(home: Path, ref: str, pr: DeployProgress, mirror: s
 
 
 def _create_venv(home: Path, py: Path, pr: DeployProgress) -> Dict[str, Any]:
-    """建 .venv：优先 uv（能自动下载 Python 3.12），否则系统 python + 版本校验。"""
+    """建 .venv：优先 uv（能自动下载 Python 3.12），否则系统 python + 版本校验。
+
+    为什么优先 uv：AstrBot 要求 Python≥3.12，而 Ubuntu 22.04 仓库里只有 3.10；
+    uv 能自己下 3.12，不需要用户手动加 PPA。
+    """
 
     python_info = python_report()
     if not python_info["ok"]:
@@ -1911,6 +2045,15 @@ def _create_venv(home: Path, py: Path, pr: DeployProgress) -> Dict[str, Any]:
             timeout=900,
             on_line=lambda line: pr.log_line(line),
         )
+        if not created.ok and not py.is_file() and not plat.IS_WINDOWS:
+            # Debian/Ubuntu 的 python3-venv 没装时，`-m venv` 会失败在 ensurepip 上
+            pr(
+                "venv",
+                0.50,
+                "创建虚拟环境失败，可能是没装 python3-venv；"
+                f"下一步：sudo apt install -y python3-venv（或 python{ASTRBOT_PREFERRED_PYTHON}-venv）后重试",
+                level="warn",
+            )
 
     if not py.is_file():
         base_version = python_info.get("version") or "未知"
@@ -1918,17 +2061,52 @@ def _create_venv(home: Path, py: Path, pr: DeployProgress) -> Dict[str, Any]:
             f"创建 Python 虚拟环境失败（{venv_dir}）。\n"
             f"系统 Python：{python_info.get('base')}（{base_version}），要求 "
             f"{python_info['min_version']}+。\n"
-            f"下一步：安装 Python 3.12+（{PYTHON_DOWNLOAD_URL}，安装时勾选 Add to PATH）"
-            "或安装 uv，然后重启控制台重试。"
+            f"下一步：{_python_install_hint()}"
         )
     version = _py_version(str(py)) or (0, 0)
     if version < ASTRBOT_MIN_PYTHON:
         raise DeployError(
             f"虚拟环境里的 Python 版本过低（{version[0]}.{version[1]}，要求 "
             f"{python_info['min_version']}+）。\n"
-            f"下一步：安装 Python 3.12+（{PYTHON_DOWNLOAD_URL}）或 uv 后，删除 {venv_dir} 重新部署。"
+            f"下一步：{_python_install_hint()}删除 {venv_dir} 后重新部署。"
         )
     return {"venv": str(venv_dir), "python": str(py), "version": f"{version[0]}.{version[1]}", "uv": uv}
+
+
+#: pip 输出里能说明「缺编译工具链」的特征串
+_BUILD_MARKERS = ("gcc", "g++", "cc1plus", "error: command", "Failed building wheel",
+                  "subprocess-exited-with-error", "Python.h", "compilation terminated")
+
+
+def _deps_failure_hint(out: str) -> str:
+    """依赖安装失败时的「下一步」（按平台给可执行命令）。
+
+    Linux 上很多包要现场编译（pydantic-core / aiohttp 之类），缺 build-essential 时
+    pip 只会甩一大段 gcc 报错，普通用户看不懂，所以单独点出来。
+    """
+
+    pip_mirror = "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/"
+    if plat.IS_WINDOWS:
+        return (
+            f"1) 检查网络能否访问 PyPI（可配置国内镜像：{pip_mirror}）；"
+            "2) 确认磁盘剩余空间 > 3GB；3) 重试一次。"
+        )
+    build_cmd = "sudo apt install -y build-essential python3.12-dev python3.12-venv"
+    text = str(out or "").lower()
+    if any(marker.lower() in text for marker in _BUILD_MARKERS):
+        return (
+            "1) 日志里出现了编译错误：先装编译工具链再重试：\n"
+            f"    {build_cmd}\n"
+            f"2) 检查网络能否访问 PyPI（可配置国内镜像：{pip_mirror}）；"
+            "3) 确认磁盘剩余空间 > 3GB；4) 重试一次。"
+        )
+    return (
+        f"1) 检查网络能否访问 PyPI（可配置国内镜像：{pip_mirror}）；"
+        "2) 确认磁盘剩余空间 > 3GB；"
+        "3) 日志里若出现 gcc / 'Failed building wheel' / 'Python.h' 之类的编译报错，"
+        f"先装编译工具链：{build_cmd}；"
+        "4) 重试一次。"
+    )
 
 
 def _install_astrbot_deps(home: Path, py: Path, pr: DeployProgress, uv: str = "") -> None:
@@ -1959,17 +2137,19 @@ def _install_astrbot_deps(home: Path, py: Path, pr: DeployProgress, uv: str = ""
         pr("deps", 0.86, "uv sync 也失败，改用 pip 重试……", level="warn")
     pip_args = [str(py), "-m", "pip", "install", "--disable-pip-version-check", "-r", "requirements.txt"]
     _run([str(py), "-m", "pip", "install", "--upgrade", "pip"], cwd=home, timeout=600, on_line=on_line)
-    _run_checked(
+    result = _run(
         pip_args,
         cwd=home,
         timeout=DEPS_TIMEOUT,
-        what="安装 AstrBot 依赖",
-        hint=(
-            "1) 检查网络能否访问 PyPI（可配置国内镜像：pip config set global.index-url "
-            "https://mirrors.aliyun.com/pypi/simple/）；2) 确认磁盘剩余空间 > 3GB；3) 重试一次。"
-        ),
         on_line=on_line,
     )
+    if not result.ok:
+        parts = [f"安装 AstrBot 依赖失败（退出码 {result.code}）。"]
+        tail = result.tail()
+        if tail:
+            parts.append(f"最后输出：\n{tail}")
+        parts.append(f"下一步：{_deps_failure_hint(result.out)}")
+        raise DeployError("\n".join(parts))
     pr("deps", 0.94, "依赖安装完成（pip）")
 
 
@@ -2212,7 +2392,7 @@ def snowluma_cwd(cfg: AppConfig) -> Path:
 
 
 def snowluma_argv(cfg: AppConfig) -> List[str]:
-    """full → 自带 node.exe；lite → PATH 里的 node（先做版本预检）。"""
+    """full → 自带 node（Windows: node.exe，Linux: 包内 ./node）；lite → PATH 里的 node。"""
 
     home = snowluma_dir(cfg)
     entry = home / SNOWLUMA_ENTRY
@@ -2222,19 +2402,21 @@ def snowluma_argv(cfg: AppConfig) -> List[str]:
             "下一步：打开「部署」页点「安装 SnowLuma」，或检查安装目录是否被移动。"
         )
     edition = str(cfg.snowluma.edition or "full").strip().lower()
-    node_exe = home / f"node{EXE_SUFFIX}"
+    node_exe = home / plat.node_bin_name()
     if edition == "full":
         if not node_exe.is_file():
             raise DeployError(
                 f"当前选用 full 版，但安装目录里没有 {node_exe.name}（{home}）。\n"
                 "下一步：重新部署 SnowLuma 选择 full 版，或到设置里把「版本类型」改成 lite（需要系统 Node.js）。"
             )
+        # 离线 zip 转存会丢可执行位，这里兜底补一次（Windows 上是空操作）
+        plat.chmod_exec(node_exe)
         return [str(node_exe), SNOWLUMA_ENTRY]
     node = _which("node")
     if not node:
         raise DeployError(
             "当前选用 lite 版，但系统里没有找到 Node.js。\n"
-            "下一步：改用 full 版（自带 node.exe，无需安装 Node），或安装 Node.js "
+            f"下一步：改用 full 版（自带 {plat.node_bin_name()}，无需安装 Node），或安装 Node.js "
             f"{NODE_REQUIRED} 后重启控制台。"
         )
     check_node_version(home, node)
@@ -2313,12 +2495,22 @@ def astrbot_argv(cfg: AppConfig) -> List[str]:
 
 
 def astrbot_env(cfg: AppConfig) -> Dict[str, str]:
-    return {
+    """AstrBot 的启动环境。
+
+    显式给 ``ASTRBOT_ROOT``：AstrBot 默认按 ``main.py`` 的位置推自己的根目录，
+    一旦控制台用软链/自定义安装目录启动，推出来的路径就可能不是安装目录
+    （Linux 上尤其容易踩），所以直接把根目录钉死。
+    """
+
+    env = {
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
         "ASTRBOT_DASHBOARD_PORT": str(int(cfg.astrbot.webui_port)),
     }
+    with contextlib.suppress(DeployError, OSError):
+        env["ASTRBOT_ROOT"] = str(astrbot_dir(cfg))
+    return env
 
 
 def snowluma_service_def() -> ServiceDef:

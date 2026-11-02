@@ -7,7 +7,7 @@
 
 <meta name="color-scheme" content="light dark">
 <title>SnowLuma × AstrBot 联合控制台</title>
-<meta name="description" content="Windows 图形化控制台：一键部署 SnowLuma（QQ 协议端）与 AstrBot（大模型机器人框架），零代码完成 QQ × 大模型联动。">
+<meta name="description" content="图形化控制台：一键部署 SnowLuma（QQ 协议端）与 AstrBot（大模型机器人框架），零代码完成 QQ × 大模型联动。支持 Windows 10/11 与 Linux x64。">
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <script>
 /* 首帧防闪：解析期就把 data-theme 打上（localStorage → 系统偏好 → 浅色） */
@@ -187,7 +187,7 @@
         <div>
           <h1>部署</h1>
           <p class="lede">第一次使用请先安装两个项目。安装包从官方仓库下载，全程可看日志；中途不要关闭本页面。</p>
-          <p class="muted sm">说明：所有下载/安装都在后台静默执行，<b>不会弹出任何命令行黑框</b>；进度与输出都显示在下方日志里。</p>
+          <p class="muted sm" id="deploy-silent-note">说明：所有下载/安装都在后台静默执行，<b>不会弹出任何命令行黑框</b>；进度与输出都显示在下方日志里。</p>
         </div>
         <div class="page-head-actions">
           <a class="btn ghost sm" href="#term" title="实时看 git/uv/pip 的输出">在终端中看进度</a>
@@ -308,7 +308,7 @@
           <button class="btn ghost sm" type="button" id="drop-backups">清空备份（data\backups）</button>
           <span class="muted sm" id="usage-total"></span>
         </div>
-        <p class="hint">「卸载」会把目录备份到 <code>data\backups</code>（可回滚）；「彻底删除」直接删掉安装目录和它的历史备份，不可恢复。</p>
+        <p class="hint" id="dep-uninstall-note">「卸载」会把目录备份到 <code>data\backups</code>（可回滚）；「彻底删除」直接删掉安装目录和它的历史备份，不可恢复。</p>
       </section>
       <section class="card">
         <div class="card-head"><h2>安装位置与运行环境</h2><span class="muted sm">路径可用环境变量 SLAB_RUNTIME 覆盖</span></div>
@@ -377,7 +377,7 @@
 
         <!-- 安装位置 / 数据目录 / 配置备份 —— 给别人用的时候最常改的东西 -->
         <section class="card" id="card-paths">
-          <div class="card-head"><h2>安装位置与备份</h2><span class="muted sm">想装到 D 盘就改这里；留空用默认位置</span></div>
+          <div class="card-head"><h2>安装位置与备份</h2><span class="muted sm" id="cfg-paths-head">想装到 D 盘就改这里；留空用默认位置</span></div>
           <div class="field-grid">
             <label class="field">
               <span>SnowLuma 安装目录 <code>snowluma.install_dir</code></span>
@@ -461,7 +461,7 @@
             <details class="qq-trouble">
               <summary>升级会不会丢配置 / 装好的项目？（点开）</summary>
               <ul>
-                <li>程序文件：被新版本覆盖，覆盖前自动备份到 <code>data\backups\program-v…</code></li>
+                <li id="upgrade-backup-li">程序文件：被新版本覆盖，覆盖前自动备份到 <code>data\backups\program-v…</code></li>
                 <li>配置：不动；旧格式会自动迁移，迁移前留 <code>config.v…bak.json</code></li>
                 <li>SnowLuma / AstrBot 安装：不动，不用重装、不用重新扫码</li>
                 <li>覆盖时程序自动退出，完成后自动启动；覆盖失败会自动回滚到旧版本</li>
@@ -640,7 +640,7 @@
       <section class="card" id="card-login-qq">
         <div class="card-head"><h2>接入 QQ（登录机器人账号）</h2><span class="muted sm">SnowLuma 不会弹二维码：扫码是在 QQ 客户端里扫</span></div>
         <ol class="qq-steps">
-          <li><b>用机器人账号登录 QQ 客户端</b>：打开电脑版 QQ（NT 版），用要当机器人的号扫码登录；登录后<b>别退出、别切号</b>，让 QQ 留在后台运行。</li>
+          <li id="qq-step-login"><b>用机器人账号登录 QQ 客户端</b>：打开电脑版 QQ（NT 版），用要当机器人的号扫码登录；登录后<b>别退出、别切号</b>，让 QQ 留在后台运行。</li>
           <li><b>启动 SnowLuma</b>：在上面卡片点「启动」。它会自动发现并注入 QQ 进程，日志会出现 <code>[Hook] login detected</code> → <code>[OneBot] session started</code>。</li>
           <li><b>确认接入</b>：点「检查账号」，能列出 QQ 号就成功了；也可以打开 SnowLuma 面板看进程与连接状态。</li>
           <li><b>保持在线</b>：关掉 QQ 客户端 = 机器人掉线；多开就多登一个 QQ，SnowLuma 会为每个账号各建一条连接。</li>
@@ -651,6 +651,8 @@
           <span class="muted sm" id="qq-check-result"></span>
         </div>
         <div class="qq-processes" id="qq-processes"><p class="muted sm">点下面的「刷新进程」读取本机正在运行的 QQ。</p></div>
+        <p class="hint" id="qq-linux-hint" hidden></p>
+        <p class="hint" id="qq-linux-install" hidden></p>
         <div class="btn-row">
           <button class="btn ghost sm" id="qq-refresh" type="button">刷新进程</button>
           <button class="btn ghost sm" id="qq-launch" type="button">隔离启动 QQ</button>
@@ -660,9 +662,9 @@
         <details class="qq-trouble">
           <summary>没检测到账号？常见原因（点开）</summary>
           <ul>
-            <li><b>权限不一致</b>：QQ 用管理员运行，SnowLuma 也要管理员（反之亦然）；两者必须是同一个 Windows 用户。</li>
+            <li id="qq-trouble-perm"><b>权限不一致</b>：QQ 用管理员运行，SnowLuma 也要管理员（反之亦然）；两者必须是同一个 Windows 用户。</li>
             <li><b>QQ 版本太老</b>：需要 QQ NT 版（9.9 及以上），老版不支持注入。</li>
-            <li><b>杀软拦截</b>：把 SnowLuma 安装目录加入白名单，再重启 SnowLuma。</li>
+            <li id="qq-trouble-antivirus"><b>杀软拦截</b>：把 SnowLuma 安装目录加入白名单，再重启 SnowLuma。</li>
             <li><b>手动注入</b>：SnowLuma 面板 → 进程列表 → 对目标进程点「注入 / 加载」；还不行就重启 QQ 再试。</li>
             <li><b>账号风控</b>：新号或异地登录容易触发验证，先在 QQ 里完成验证再启动。</li>
             <li>完整说明见 <code>docs/MANUAL.md</code>「三、登录机器人 QQ」。</li>
@@ -846,7 +848,7 @@
   <div class="dialog-body">
     <ol class="help-steps">
       <li><b>部署</b>：在「部署」页点 <i>下载安装</i>（SnowLuma，建议 full 版）和 <i>克隆并安装依赖</i>（AstrBot）。</li>
-      <li><b>登录 QQ</b>：用**机器人小号**在电脑版 QQ（NT 版 9.9+）里扫码登录，登录后保持 QQ 在后台运行。<br>
+      <li id="help-step-qq"><b>登录 QQ</b>：用**机器人小号**在电脑版 QQ（NT 版 9.9+）里扫码登录，登录后保持 QQ 在后台运行。<br>
           SnowLuma 不会弹二维码——它通过注入 QQ 进程来接管会话，所以扫码动作在 QQ 客户端里完成。</li>
       <li><b>配置</b>：填 QQ 号（建议小号）、大模型 API Key 与模型名，点「保存设置」。</li>
       <li><b>写入联动</b>：「联调」页点「写入联动配置」，把端口与 Token 同步进两个项目。</li>
@@ -860,7 +862,7 @@
       <li><b>消息不回复</b>：检查 API Key、模型名，以及触发规则是否匹配（群里需要 @ 或前缀）。</li>
       <li><b>多开 QQ</b>：SnowLuma 会给每个已登录账号各建一条 AstrBot 连接，只要有一条正常就算连通。</li>
       <li><b>端口被占用</b>：在「配置」页换一个端口，然后重新「写入联动配置」。</li>
-      <li><b>杀软拦截 node.exe</b>：把安装目录加入白名单后重试部署。</li>
+      <li id="help-faq-antivirus"><b>杀软拦截 node.exe</b>：把安装目录加入白名单后重试部署。</li>
     </ul>
     <p class="muted sm">完整手册：<code>docs/MANUAL.md</code>（含「登录机器人 QQ」图文步骤）；其它：<code>README.md</code>、<code>docs/DEPLOY.md</code>、<code>docs/TROUBLESHOOTING.md</code>、<code>docs/ARCHITECTURE.md</code>。接口调试可访问 <a href="/api/docs" target="_blank" rel="noopener">/api/docs</a>。</p>
   </div>
@@ -924,7 +926,7 @@
         <div class="wiz-log" id="wiz-deploy-log" aria-live="polite"></div>
         <div class="btn-row">
           <button class="btn primary sm" id="wiz-install" type="button">开始安装</button>
-          <span class="muted sm">大约 3–10 分钟；过程中不会弹命令行黑框</span>
+          <span class="muted sm" id="wiz-install-note">大约 3–10 分钟；过程中不会弹命令行黑框</span>
         </div>
       </section>
 

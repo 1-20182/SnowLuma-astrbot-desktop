@@ -22,7 +22,12 @@ def test_state_shape():
     assert body["ok"] is True
     assert "config" in body and "services" in body and "env" in body
     assert body["config"]["link"]["token"] == "***"
-    assert body["env"]["tools"]["python"]["ok"] is True
+    env = body["env"]
+    # 平台无关：Linux 上通常没有 `python` 别名（只有 python3），envcheck 会退回探测 python3，
+    # 所以这里断言"能报出解释器版本"，不再假设 PATH 上有 `python`
+    assert env["tools"]["python"]["ok"] is True
+    assert str(env["python_version"]).startswith("3.")
+    assert isinstance(env["is_windows"], bool) and isinstance(env["is_linux"], bool)
 
 
 def test_config_update_and_mask():

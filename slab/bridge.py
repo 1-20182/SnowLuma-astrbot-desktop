@@ -49,6 +49,10 @@ SERVICE_NAME = "bridge"
 DEFAULT_ACTION_TIMEOUT = 20.0
 #: 事件审计保留条数
 MAX_AUDIT = 50
+#: 同一条消息（同 self_id + message_id）的去重窗口（秒）
+DEDUPE_WINDOW = 5.0
+#: 去重表最多记多少条 message_id
+MAX_DEDUPE = 512
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +132,7 @@ class Bridge:
             "events_in": 0,
             "events_forwarded": 0,
             "events_dropped": 0,
+            "events_duplicate": 0,
             "actions_in": 0,
             "actions_ok": 0,
             "actions_failed": 0,
@@ -136,6 +141,11 @@ class Bridge:
             "last_action_at": 0.0,
         }
         self.recent: List[Dict[str, Any]] = []
+        #: 同一条消息只转发一次。SnowLuma 里若同时存在 native 直连 wsClient 与中继
+        #: wsServer（或中继被启动了两份），同一个 message_id 会到两次；转发两次
+        #: AstrBot 就处理两遍、回两遍 —— 用户看到的是「发一条，机器人回两条」。
+        self.dedupe_window = DEDUPE_WINDOW
+        self._seen_messages: Dict[str, float] = {}
         self._stop_event = asyncio.Event()
         self._upstream_started = False
         self._stopping = False
@@ -254,8 +264,41 @@ class Bridge:
                 self._record(direction="in", event=event, forwarded=False, reason=reason)
             return
 
+        duplicate, seen_reason = self._is_duplicate(event)
+        if duplicate:
+            self.stats["events_dropped"] += 1
+            self.stats["events_duplicate"] += 1
+            self.stats["last_drop_reason"] = seen_reason
+            self._record(direction="in", event=event, forwarded=False, reason=seen_reason)
+            return
+
         task = asyncio.create_task(self._forward_event(event), name="bridge-forward")
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+    def _is_duplicate(self, event: OneBotEvent) -> Tuple[bool, str]:
+        """同一条消息（同 self_id + message_id）在窗口内只放行一次。
+
+        SnowLuma 只要同时存在 native 直连 wsClient 与中继 wsServer（或中继被
+        启动了两份），同一个 ``message_id`` 就会到我们两次；放行两次 AstrBot 就
+        回两遍。这里做最后一道防线，正常情况下由「中继模式清理残留直连」根治。
+        """
+
+        if not event.is_message or not event.message_id or self.dedupe_window <= 0:
+            return False, ""
+        key = f"{event.self_id or self.self_id}:{event.message_id}"
+        now = time.time()
+        last = self._seen_messages.get(key)
+        if last is not None and (now - last) < self.dedupe_window:
+            return True, f"重复事件（message_id={event.message_id} 已转发过，疑似存在直连+中继双通道）"
+        self._seen_messages[key] = now
+        if len(self._seen_messages) > MAX_DEDUPE:
+            cutoff = now - self.dedupe_window
+            self._seen_messages = {
+                item_key: ts for item_key, ts in self._seen_messages.items() if ts >= cutoff
+            }
+            while len(self._seen_messages) > MAX_DEDUPE:
+                self._seen_messages.pop(next(iter(self._seen_messages)))
+        return False, ""
 
     async def _forward_event(self, event: OneBotEvent) -> None:
         ok = await self.upstream.send_event(event)
@@ -401,6 +444,7 @@ class Bridge:
                 "forward_non_text": self.filters.forward_non_text,
             },
             "stats": dict(self.stats),
+            "dedupe_window": self.dedupe_window,
             "upstream": self.upstream.status(),
             "downstream": self.downstream.status(),
             "recent": list(self.recent[-MAX_AUDIT:]),
@@ -428,9 +472,26 @@ async def _service_task() -> None:
 
     global _bridge
     logged = False
+    healed = False
     while True:
         cfg = get_config()
         if cfg.link.mode == "bridge":
+            if not healed:
+                # 起中继前先把 SnowLuma 里 native 时代残留的直连 wsClient 清掉：
+                # 它和目标中继会把同一条消息各投递一次，AstrBot 就会回两遍。
+                healed = True
+                try:
+                    fixed = await snowluma_admin.ensure_single_channel(cfg)
+                except Exception as exc:  # noqa: BLE001 - 自愈失败不影响中继启动
+                    log.warning("清理残留直连适配器失败（忽略）：%s", exc)
+                else:
+                    if fixed.get("changed"):
+                        bus.log(SERVICE_NAME, f"⚠ {fixed.get('detail')}", level="warning")
+                        # 等 SnowLuma 把那条直连彻底断开、AstrBot 清完旧登记再连上来：
+                        # 否则可能"连上了但没登记成可发送的 bot"（表现为能收不能发）。
+                        await asyncio.sleep(2.0)
+                    elif fixed.get("ok"):
+                        log.debug("没有残留的 native 直连，事件只会投递一次")
             bridge = Bridge(cfg)
             _bridge = bridge
             try:
@@ -445,6 +506,45 @@ async def _service_task() -> None:
             bus.log(SERVICE_NAME, "当前为 native 模式，中继待机（不建立连接）")
             logged = True
         await asyncio.sleep(2.0)
+
+
+async def reregister(cfg: Optional[AppConfig] = None, *, timeout: float = 20.0) -> Dict[str, Any]:
+    """让中继**重新接入** AstrBot —— 也就是重新登记「可发送的 bot」。
+
+    为什么需要重连才能修：aiocqhttp 的 ``_wsr_api_clients`` 是按 ``X-Self-ID``
+    存的一张表，任意一条同 ``self_id`` 的连接断开时，它都直接 ``del`` 这条登记
+    （``_remove_wsr_api_client`` 不校验是不是自己）。所以只要有一条「别的」同账号
+    连接短暂连进 AstrBot 又断开（例如旧版本控制台的 WS 握手探针），中继这条真实
+    连接就变成「连着的黑户」：事件照收，AstrBot 却认为没有 bot 可用，所有回复都
+    ``ApiNotAvailable`` —— 用户看到的就是「能收不能发」，而且不重连永远好不了。
+
+    做法：停中继 → 等 AstrBot 把旧连接注销干净 → 起中继 → 等到上游 WS 真的连上。
+    只适用于 bridge 模式；native 模式下「可发送的 bot」是 SnowLuma 自己那条连接。
+    """
+
+    cfg = cfg or get_config()
+    if SERVICE_NAME not in supervisor.definitions():
+        return {"ok": False, "detail": "中继服务未注册（可能尚未部署）"}
+    if str(cfg.link.mode) != "bridge":
+        return {"ok": False, "skipped": True, "detail": "当前是 native 模式，不需要重启中继"}
+    try:
+        await supervisor.stop(SERVICE_NAME)
+        # 给 AstrBot 一点时间把旧连接注销：新旧连接重叠时它会按 self_id 误删新登记
+        await asyncio.sleep(1.5)
+        await supervisor.start(SERVICE_NAME, cfg)
+    except Exception as exc:  # noqa: BLE001 - 交由调用方展示
+        return {"ok": False, "detail": f"重启中继失败：{exc}"}
+    deadline = time.monotonic() + float(timeout)
+    while time.monotonic() < deadline:
+        bridge = _bridge
+        if bridge is not None and bridge.upstream.connected:
+            return {
+                "ok": True,
+                "detail": "中继已重新接入 AstrBot（bot 登记已刷新）",
+                "self_id": bridge.self_id,
+            }
+        await asyncio.sleep(0.4)
+    return {"ok": False, "detail": f"{int(timeout)} 秒内中继没重新连上 AstrBot（看「运行」页日志）"}
 
 
 def register_service() -> None:
@@ -529,6 +629,14 @@ async def _collect_status(cfg: AppConfig) -> Dict[str, Any]:
         onebot["ready"] = bool(up and down)
         onebot["bridge_upstream"] = bool(up)
         onebot["bridge_downstream"] = bool(down)
+        # 中继模式下「接进 AstrBot 的那条 OneBot 连接」是中继自己提供的，SnowLuma
+        # 的 wsClients 天生为空。这里按中继上游算，否则界面/自检会永远显示「未连接」，
+        # 还会顺着这条错提示去「写入配置」——那正好会写出第二条直连、把 bot 登记冲掉。
+        onebot["clients_connected"] = 1 if up else 0
+        onebot["clients_source"] = "bridge"
+        onebot["clients_note"] = (
+            "中继模式下这条连接由内置中继提供，SnowLuma 侧不需要（也不应该有）wsClient"
+        )
         onebot["hint"] = "中继双向已连" if onebot["ready"] else "中继连接未就绪"
 
     suggestions = list(snowluma.get("suggestions") or []) + list(astrbot.get("suggestions") or [])
@@ -731,7 +839,15 @@ async def apply_link(
                 "step": f"apply_snowluma_{cfg.link.mode}",
                 "ok": bool(snowluma_result.get("ok")),
                 "detail": snowluma_result.get("error")
-                or f"已写入 {len(snowluma_result.get('files') or [])} 个配置文件",
+                or (
+                    f"已写入 {len(snowluma_result.get('files') or [])} 个配置文件"
+                    + (
+                        f"，并清理了 {len(snowluma_result.get('removed_direct_clients') or [])} 条"
+                        " native 直连（否则同一条消息会被投递两次、机器人回两遍）"
+                        if snowluma_result.get("removed_direct_clients")
+                        else ""
+                    )
+                ),
                 "result": snowluma_result,
             }
         )

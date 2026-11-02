@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -385,23 +386,72 @@ def installed_cfg(tmp_path, monkeypatch):
     return cfg, home
 
 
-def test_open_dir_launches_explorer(installed_cfg, monkeypatch):
+def _patch_opener(monkeypatch, opened: list[str]) -> None:
+    """把「打开目录」换成一个只记录调用的假实现。
+
+    平台差异（explorer / xdg-open）由 ``slab.plat.open_path`` 负责，单独用
+    ``test_open_dir_uses_platform_command`` 按平台断言，路由层只管调用与错误映射。
+    """
+
+    def fake_open(path):
+        opened.append(str(path))
+        return True
+
+    monkeypatch.setattr(routes_deploy, "_open_path", fake_open)
+
+
+def test_open_dir_launches_platform_opener(installed_cfg, monkeypatch):
     cfg, home = installed_cfg
-    opened: list[list[str]] = []
-
-    def fake_popen(argv, **kwargs):
-        opened.append([str(a) for a in argv])
-        return object()
-
-    monkeypatch.setattr(routes_deploy.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(routes_deploy.os, "name", "nt")
+    opened: list[str] = []
+    _patch_opener(monkeypatch, opened)
     with _client() as client:
         response = client.post("/api/deploy/open-dir", json={"target": "snowluma"})
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
     assert body["path"] == str(home)
-    assert opened and opened[0][0] == "explorer" and opened[0][1] == str(home)
+    assert opened == [str(home)]
+
+
+def test_open_dir_uses_platform_command(monkeypatch):
+    """真正去开目录的那条命令要按平台切换：Windows=explorer，Linux=xdg-open。
+
+    两个平台都是 fire-and-forget 的 ``Popen``（资源管理器卡在"恢复会话"时不能连带挂住
+    控制台的请求线程），所以只 patch ``Popen``；再用 ``inspect.getsource`` 钉住
+    "Windows 分支不许改成 run 等结果"这个契约，免得以后又被重构掉。
+    """
+
+    from slab import plat
+
+    opened: list[list[str]] = []
+
+    def fake_popen(argv, **kwargs):
+        opened.append([str(a) for a in argv])
+        return object()
+
+    if plat.IS_WINDOWS:
+        monkeypatch.setattr(plat.subprocess, "Popen", fake_popen)
+        assert plat.open_path(Path(r"C:\bots")) is True
+        assert opened and opened[0][0] == "explorer" and opened[0][1] == r"C:\bots"
+        source = inspect.getsource(plat.open_path)
+        assert 'Popen(["explorer"' in source, "Windows 分支必须是 fire-and-forget 的 Popen"
+    else:
+        monkeypatch.setattr(plat.shutil, "which",
+                            lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else "")
+        monkeypatch.setattr(plat.subprocess, "Popen", fake_popen)
+        assert plat.open_path(Path("/opt/bots")) is True
+        # POSIX 上 **不能** 是 explorer，必须是文件管理器程序（xdg-open）
+        assert opened and opened[0][0].endswith("xdg-open") and opened[0][1] == "/opt/bots"
+
+
+def test_open_dir_without_file_manager_is_501(installed_cfg, monkeypatch):
+    """没有文件管理器（无头 Linux）时要给 501 + 可复制的路径，而不是 500。"""
+
+    monkeypatch.setattr(routes_deploy, "_open_path", lambda path: False)
+    with _client() as client:
+        response = client.post("/api/deploy/open-dir", json={"target": "snowluma"})
+    assert response.status_code == 501
+    assert "手动打开这个路径" in response.json()["error"]
 
 
 def test_open_dir_missing_directory_is_chinese_400(installed_cfg, monkeypatch):
@@ -431,18 +481,19 @@ def test_open_dir_rejects_path_outside_sandbox(installed_cfg, monkeypatch):
     assert "未授权" in response.json()["error"] or "系统目录" in response.json()["error"]
 
 
-def test_open_dir_data_target(monkeypatch):
+def test_open_dir_data_target(tmp_path, monkeypatch):
     from slab import paths
 
-    opened: list[list[str]] = []
-    monkeypatch.setattr(routes_deploy.subprocess, "Popen",
-                        lambda argv, **kw: opened.append([str(a) for a in argv]) or object())
-    monkeypatch.setattr(routes_deploy.os, "name", "nt")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(routes_deploy.paths, "DATA_DIR", data_dir)
+    opened: list[str] = []
+    _patch_opener(monkeypatch, opened)
     with _client() as client:
         response = client.post("/api/deploy/open-dir", json={"target": "data"})
     assert response.status_code == 200
     assert response.json()["path"] == str(Path(paths.DATA_DIR))
-    assert opened
+    assert opened == [str(data_dir)]
 
 
 # --------------------------------------------------------------------------- #

@@ -291,6 +291,86 @@ async def test_apply_relay_adds_server_when_missing(cfg: AppConfig, tmp_path: Pa
     assert servers[0]["name"] == snowluma_admin.RELAY_SERVER_NAME
 
 
+def _with_native_direct_client(cfg: AppConfig) -> dict:
+    """在用户配置里加上 native 时代那条「直连 AstrBot」的 wsClient。"""
+
+    data = _per_uin_config()
+    data["networks"]["wsClients"].append(dict(snowluma_admin.ws_client_entry(cfg)))
+    return data
+
+
+async def test_apply_relay_removes_native_direct_client(cfg: AppConfig, tmp_path: Path) -> None:
+    """中继模式必须清掉 native 留下的直连，否则同一条消息被投递两次、机器人回两遍。"""
+
+    home = _sl_home(tmp_path)
+    data = _with_native_direct_client(cfg)
+    _write(home / "config" / "onebot.json", data)
+    _write(home / "config" / "onebot_3985934176.json", data)
+
+    result = await snowluma_admin.apply_relay(cfg, home=home, hot=False)
+
+    assert result["ok"] is True
+    removed = result["removed_direct_clients"]
+    assert len(removed) == 2  # 模板 + 账号快照各一条
+    assert {item["name"] for item in removed} == {"astrbot"}
+    for path in (home / "config" / "onebot.json", home / "config" / "onebot_3985934176.json"):
+        clients = _read(path)["networks"]["wsClients"]
+        # 只删我们那条直连，用户自己的连接原样保留
+        assert [item["name"] for item in clients] == ["external-bot"]
+    # 中继自己的 wsServer 仍然在
+    servers = _read(home / "config" / "onebot_3985934176.json")["networks"]["wsServers"]
+    assert any(item["port"] == 3001 for item in servers)
+
+
+def test_strip_direct_clients_matches_renamed_client_by_url(cfg: AppConfig) -> None:
+    """用户给直连改过名字也要命中（按 URL 指向 AstrBot 反向 WS 判定）。"""
+
+    config = snowluma_admin.ensure_skeleton({})
+    config["networks"]["wsClients"] = [
+        {"name": "我的AstrBot", "url": "ws://127.0.0.1:6199/ws", "accessToken": "x"},
+        {"name": "external-bot", "url": "ws://10.0.0.9:9999/ws", "accessToken": "y"},
+    ]
+    stripped, removed = snowluma_admin.strip_direct_clients(config, cfg)
+    assert [item["name"] for item in removed] == ["我的AstrBot"]
+    assert [item["name"] for item in stripped["networks"]["wsClients"]] == ["external-bot"]
+    assert len(config["networks"]["wsClients"]) == 2  # 不就地改动传入配置
+
+
+async def test_ensure_single_channel_heals_only_once(cfg: AppConfig, tmp_path: Path) -> None:
+    home = _sl_home(tmp_path)
+    _write(home / "config" / "onebot_3985934176.json", _with_native_direct_client(cfg))
+
+    first = await snowluma_admin.ensure_single_channel(cfg, home=home, hot=False)
+    assert first["ok"] is True and first["changed"] is True
+    assert len(first["removed"]) == 1 and first["files"]
+    clients = _read(home / "config" / "onebot_3985934176.json")["networks"]["wsClients"]
+    assert [item["name"] for item in clients] == ["external-bot"]
+
+    second = await snowluma_admin.ensure_single_channel(cfg, home=home, hot=False)
+    assert second["changed"] is False
+    assert second["removed"] == []
+
+
+async def test_snowluma_probe_flags_direct_client_in_bridge_mode(
+    cfg: AppConfig, tmp_path: Path
+) -> None:
+    """中继模式下状态页要主动提示「还留着直连，会回两遍」。"""
+
+    home = _sl_home(tmp_path)
+    _write(home / "config" / "onebot_3985934176.json", _with_native_direct_client(cfg))
+    cfg.snowluma.webui_port = 65022  # 未监听，避免测试去连真面板
+
+    cfg.link.mode = "bridge"
+    snap = await snowluma_admin.probe(cfg, home=home, timeout=0.3, log_lines=[])
+    assert snap["direct_clients"]
+    assert snap["per_uin"][0]["has_direct"] is True
+    assert any("回两遍" in item for item in snap["suggestions"])
+
+    cfg.link.mode = "native"  # native 模式下这条直连是正常的，不该报警
+    snap_native = await snowluma_admin.probe(cfg, home=home, timeout=0.3, log_lines=[])
+    assert not any("回两遍" in item for item in snap_native["suggestions"])
+
+
 async def test_apply_webui_writes_runtime_json(cfg: AppConfig, tmp_path: Path) -> None:
     home = _sl_home(tmp_path)
     _write(home / "config" / "runtime.json", {"webuiPort": 5199, "logRetainDays": 3, "logPerUin": True})
@@ -581,7 +661,9 @@ async def test_probe_onebot_ws_headers_and_mapping(cfg: AppConfig, monkeypatch) 
     assert captured["url"] == f"ws://127.0.0.1:{cfg.link.ws_port}/ws"
     headers = captured["headers"]
     assert headers["Authorization"] == f"Bearer {cfg.link.token}"
-    assert headers["X-Client-Role"].lower() == "universal"
+    # 必须用 event 角色：universal/api 会在 aiocqhttp 里登记成「可发送 bot」，
+    # 探针一断开就把中继那条真实连接的登记删掉（能收不能发）。
+    assert headers["X-Client-Role"].lower() == "event"
     assert headers["X-Self-ID"] == "3985934176"
     assert headers["User-Agent"] == "OneBot/11"
 

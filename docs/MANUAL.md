@@ -21,20 +21,30 @@
 
 ## 1. 安装与第一次启动
 
+**Windows**
+
 1. 解压 `SnowLuma-Desktop-v…-win-x64.zip`（**只解压，别在压缩包里直接双击**）
 2. 双击 `SnowLuma-Desktop.exe`
-3. 首次会弹**四步向导**：
+
+**Linux**（x64；首次请先过一遍 [LINUX.md](LINUX.md)）
+
+1. 解压 `SnowLuma-AstrBot-Console-v…-linux-x64.tar.gz` 或 `git clone` 本仓库
+2. 在项目目录**运行启动脚本** `./一键启动.sh`（等价 `.venv/bin/python3 -m slab serve`）
+3. 浏览器打开 <http://127.0.0.1:8790>
+
+**接着（两个平台一样）**——首次会弹**四步向导**：
 
 | 步骤 | 你要做的 | 判断成功的标志 |
 | --- | --- | --- |
-| ① 环境检查 | 一般无需操作，看有没有红项 | Python / Git 是绿勾；端口空闲 |
+| ① 环境检查 | 一般无需操作，看有没有红项（Linux 会多出 ptrace/setcap/DISPLAY 三项） | Python / Git 是绿勾；端口空闲 |
 | ② 安装项目 | 点两次安装（SnowLuma 约 40 MB / AstrBot 依赖 200 MB） | 两张卡都变「已安装」 |
 | ③ 填写配置 | 机器人 QQ 号（**小号**）、管理员 QQ（你自己）、大模型 Key | 点「保存设置」有绿色提示 |
 | ④ 启动 | 点「启动」 | 状态灯变绿，日志出现 `session started` |
 
 > 想跳过向导：右上角「跳过」。想看回来：清掉用户数据或换一个解压目录。
 
-**第一次启动为什么慢？** 要解压 + 过一遍杀毒软件，通常 5~15 秒；之后 2~5 秒。启动页有秒表和轮播提示，不是卡死。
+**第一次启动为什么慢？** 要解压 + 过一遍杀毒软件（Linux 上是首次建 venv / 装依赖），通常 5~15 秒；
+之后 2~5 秒。启动页有秒表和轮播提示，不是卡死。
 
 ---
 
@@ -83,22 +93,35 @@
 
 ### 3.3 方式 B：软件内隔离一个 QQ（更安全）
 
-「运行 → 隔离启动 QQ」会打开一个**独立数据目录**的 QQ 窗口：
+**Windows**：「运行 → 隔离启动 QQ」会打开一个**独立数据目录**的 QQ 窗口：
 `<存储盘>\SnowLumaAstrBot\qq\clones\bot\`，在里面登录小号，再回控制台「刷新进程 → 用这个」。
 
 隔离做了：独立 `APPDATA/LOCALAPPDATA/TEMP` + 独立 `--user-data-dir` + 注入 sandbox DLL 给互斥体改名（允许第二个 QQ 实例）。
 
-> 已知边界：QQ 的账号列表可能存在 `ProgramData`/注册表，仍然共享；彻底隔离需要注册表重定向（尚未默认开启）。
+**Linux**：没有 DLL 注入这回事（那里靠 ptrace），等价做法是**独立 HOME 多开**：
+「运行 → 接入 QQ」→「独立 HOME 多开」会用一个干净的 `HOME` 启动 `/opt/QQ/qq`，
+分身目录默认在 `<存储根>/qq/clones/<名称>/home`（存储根默认 `~/.local/share/SnowLumaAstrBot`）。
+先按 [LINUX.md](LINUX.md) §5 装官方 Linux QQ，扫完码再「刷新进程 → 用这个」。
+手工等价命令：
+
+```bash
+HOME=~/qq-bot-home XDG_CONFIG_HOME=~/qq-bot-home/.config /opt/QQ/qq --no-sandbox &
+```
+
+> 已知边界（Windows）：QQ 的账号列表可能存在 `ProgramData`/注册表，仍然共享；彻底隔离需要注册表重定向（尚未默认开启）。
+> Linux 上同理，隔离的是 `$HOME` 下的数据，登录态本身仍按账号走。
 
 ### 3.4 登录不上 / 检测不到？
 
 | 现象 | 处理 |
 | --- | --- |
-| 列表里没有 QQ 进程 | 先登录 QQ 客户端再刷新；确认是 NT 版 |
-| 提示"注入失败" | SnowLuma 没启动，或面板密码不对（见第 6 节） |
-| 日志没有 `login detected` | 权限不一致：QQ 与 SnowLuma 必须同一个 Windows 用户、同样权限 |
-| 只弹旧窗口 | 先退出你自己在用的 QQ，再点「隔离启动 QQ」 |
+| 列表里没有 QQ 进程 | 先登录 QQ 客户端再刷新；确认是 NT 版（Linux：官方 `/opt/QQ`） |
+| 提示"注入失败" | SnowLuma 没启动，或面板密码不对（见第 6 节）；Linux 上看第 3.4 节最后两行 |
+| 日志没有 `login detected` | 权限不一致：QQ 与 SnowLuma 必须同一个 Windows 用户（Linux：**同一个 uid**，两边都别用 sudo） |
+| 只弹旧窗口 | 先退出你自己在用的 QQ，再点「隔离启动 QQ」（Linux：「独立 HOME 多开」） |
 | 账号被风控 | 新号 / 异地登录常触发，先在手机 QQ 完成验证 |
+| Linux：日志里有 `EPERM` / 注入不动 | 缺 `sudo setcap cap_sys_ptrace=ep <node 真实路径>`，或 `ptrace_scope=3`；见 [LINUX.md](LINUX.md) §4 |
+| Linux：QQ 起不来 / 没有二维码窗口 | 无图形会话（`DISPLAY` 为空）；见 [LINUX.md](LINUX.md) §7 |
 
 ---
 
@@ -153,8 +176,16 @@
 
 ### 5.3 「修复发送链路」修什么
 
-自动做：切到中继 → 起 AstrBot 等就绪 → 起中继 → 重启 SnowLuma 等它连上 → 真发一条验证。
-约 30~60 秒，期间机器人不可用。
+自动做：切到中继 → 起 AstrBot 等就绪 → 清掉 SnowLuma 里残留的直连适配器 →
+**重启中继（重新登记「可发送的 bot」）** → 真发一条验证；万一还是
+`Failed to send message:`（空消息的 `ApiNotAvailable`）会再自愈重试一次。
+约 20~40 秒，期间机器人不可用。
+
+> 为什么要重连才能修：AstrBot（aiocqhttp）把「可发送的 bot」按 `X-Self-ID` 存在一张表里，
+> 任意一条同账号连接断开时它都直接删这条登记（不校验归属）。所以**别让第二个客户端用
+> 同一个 QQ 号去连 AstrBot 的反向 WS**（第三方 OneBot 面板、旧版本控制台的联调页探针都算），
+> 它们一断开就会把中继那条真实连接的登记删掉 → 能收不能发。
+> native 模式下「接进 AstrBot 的是 SnowLuma 自己那条连接」，所以那一模式的重启对象是 SnowLuma。
 
 ---
 
@@ -246,16 +277,18 @@
 
 ## 12. 文件都在哪
 
-| 内容 | 位置 |
-| --- | --- |
-| 配置、日志、备份 | `data\` |
-| SnowLuma / AstrBot 安装 | `runtime\snowluma`、`runtime\astrbot` |
-| 安装包缓存 | `downloads\` |
-| 升级日志 | `data\upgrade\upgrade.log` |
+| 内容 | Windows | Linux |
+| --- | --- | --- |
+| 配置、日志、备份 | `data\` | `~/.local/share/SnowLumaAstrBot/data/` |
+| SnowLuma / AstrBot 安装 | `runtime\snowluma`、`runtime\astrbot` | `~/.local/share/SnowLumaAstrBot/runtime/{snowluma,astrbot}` |
+| 安装包缓存 | `downloads\` | `~/.local/share/SnowLumaAstrBot/downloads/` |
+| 升级日志 | `data\upgrade\upgrade.log` | `…/data/upgrade/upgrade.log` |
+| QQ 多开分身 | `…\qq\clones\<名称>\` | `…/qq/clones/<名称>/home` |
 
-**默认存储规划**：程序会挑一块**非 C 盘**（剩余空间最大的本地固定盘）放在
+**默认存储规划**：Windows 上程序会挑一块**非 C 盘**（剩余空间最大的本地固定盘）放在
 `<那块盘>:\SnowLumaAstrBot\{data,runtime,downloads}`；机器只有一块盘时才用 C；
-老用户升级会沿用原目录（不搬家）。想指定位置：环境变量 `SLAB_STORAGE_ROOT`。
+老用户升级会沿用原目录（不搬家）。Linux 上按 XDG 放在 `~/.local/share/SnowLumaAstrBot`
+（即 `$XDG_DATA_HOME` 下）。想指定位置：环境变量 `SLAB_STORAGE_ROOT`（两个平台都支持）。
 
 ---
 

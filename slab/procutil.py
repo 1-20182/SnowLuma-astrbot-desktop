@@ -6,6 +6,8 @@ Windows 都会给子进程新建一个黑色 DOS 窗口——部署一次能看�
 用户会以为中了病毒。所以所有子进程都必须带 ``CREATE_NO_WINDOW`` + 隐藏
 ``STARTUPINFO``。
 
+平台差异**只在** :mod:`slab.plat` 里判断；本模块只是它的一层薄壳（保持既有对外 API）。
+
 用法::
 
     from .procutil import hidden_kwargs, run_hidden
@@ -16,26 +18,19 @@ Windows 都会给子进程新建一个黑色 DOS 窗口——部署一次能看�
 
 from __future__ import annotations
 
-import os
 import subprocess
 from typing import Any, Dict, List, Sequence
 
-IS_WINDOWS = os.name == "nt"
-CREATE_NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW（这里写成常量，便于非 Windows 上引用）
+from . import plat
+
+IS_WINDOWS = plat.IS_WINDOWS
+CREATE_NO_WINDOW = plat.CREATE_NO_WINDOW  # subprocess.CREATE_NO_WINDOW（这里写成常量，便于非 Windows 上引用）
 
 
 def hidden_kwargs() -> Dict[str, Any]:
-    """返回让子进程不显示窗口的 Popen 参数（非 Windows 返回空 dict）。"""
+    """返回让子进程不显示窗口的 Popen 参数（POSIX 返回空 dict）。"""
 
-    if not IS_WINDOWS:
-        return {}
-
-    kwargs: Dict[str, Any] = {"creationflags": CREATE_NO_WINDOW}
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-    kwargs["startupinfo"] = startupinfo
-    return kwargs
+    return plat.hidden_kwargs()
 
 
 def hidden_console_kwargs() -> Dict[str, Any]:
@@ -43,15 +38,12 @@ def hidden_console_kwargs() -> Dict[str, Any]:
 
     与 ``hidden_kwargs``（完全无控制台）的区别：服务自己再 ``subprocess`` 拉子进程时，
     子进程会继承这个隐藏控制台，不会各自新开黑窗（例如 AstrBot 装插件、T2I 渲染）。
+
+    POSIX 上的等价物是"独立会话 + 独立进程组"（``start_new_session``），
+    这样关窗/退出时 ``kill_tree`` 能按进程组收掉整棵树。
     """
 
-    if not IS_WINDOWS:
-        return {}
-
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-    return {"creationflags": subprocess.CREATE_NEW_CONSOLE, "startupinfo": startupinfo}
+    return plat.hidden_console_kwargs()
 
 
 def run_hidden(argv: Sequence[str], *, timeout: float | None = 60, cwd: str | None = None,

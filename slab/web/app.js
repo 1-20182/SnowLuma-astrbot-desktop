@@ -141,6 +141,205 @@
   };
 
   /* ====================================================================== *
+   * 1.5 平台层（前端侧）
+   *
+   * 规矩：平台判定**只读后端**返回的字段（envcheck.env_report() → /api/state 的 env）：
+   *   env.is_linux / env.is_windows  →  env.tag / env.platform_tag  →  env.os  →  env.platform
+   * 前端**不嗅探**系统（不看浏览器 UA 字符串、不看 navigator 的平台字段），判不出来就用中性文案，
+   * 绝不断言「这台是 Windows」。最近一次判定的结果缓存在 localStorage，断线时也能说对话。
+   * ====================================================================== */
+  const PLAT = { WIN: 'win', LINUX: 'linux', UNKNOWN: 'unknown' };
+  const PLAT_CACHE_KEY = 'slab-platform';
+
+  function platformOf(env) {
+    const e = env || {};
+    if (e.is_linux === true) return PLAT.LINUX;
+    if (e.is_windows === true) return PLAT.WIN;
+    const tag = String(e.tag || e.platform_tag || '').toLowerCase();
+    if (tag) {
+      if (tag.indexOf('linux') === 0) return PLAT.LINUX;
+      if (tag.indexOf('win') === 0) return PLAT.WIN;
+    }
+    const osName = String(e.os || '').toLowerCase();
+    if (osName === 'posix') return PLAT.LINUX;   // 目前只支持 Windows / Linux
+    if (osName === 'nt') return PLAT.WIN;
+    const plat = String(e.platform || '').toLowerCase();
+    if (plat.indexOf('linux') >= 0) return PLAT.LINUX;
+    if (plat.indexOf('win') >= 0) return PLAT.WIN;
+    return PLAT.UNKNOWN;
+  }
+
+  function rememberPlatform(env) {
+    const found = platformOf(env);
+    if (found === PLAT.UNKNOWN) return found;
+    try { localStorage.setItem(PLAT_CACHE_KEY, found); } catch (err) { /* 隐私模式忽略 */ }
+    return found;
+  }
+
+  function currentPlatform() {
+    const fromEnv = platformOf(S.env);
+    if (fromEnv !== PLAT.UNKNOWN) return fromEnv;
+    try {
+      const cached = localStorage.getItem(PLAT_CACHE_KEY);
+      if (cached === PLAT.LINUX || cached === PLAT.WIN) return cached;
+    } catch (err) { /* 忽略 */ }
+    return PLAT.UNKNOWN;
+  }
+
+  function isLinux() { return currentPlatform() === PLAT.LINUX; }
+
+  /** 按平台选文案：Windows 用第一份，Linux 用第二份，判不出平台时用第三份（中性，不断言系统）。 */
+  function platCopy(winText, linuxText, neutralText) {
+    const plat = currentPlatform();
+    if (plat === PLAT.LINUX) return linuxText === undefined ? winText : linuxText;
+    if (plat === PLAT.WIN) return winText;
+    return neutralText === undefined ? winText : neutralText;
+  }
+
+  /** 展示用路径拼接（Linux 用 /，Windows 用 \）。 */
+  function pathJoin(base, name) {
+    const head = String(base || '');
+    if (!head) return String(name || '');
+    if (/[\\/]$/.test(head)) return head + name;
+    return head + platCopy('\\', '/') + name;
+  }
+
+  function setById(sel, text) {
+    const node = $(sel);
+    if (node) setText(node, text);
+    return node;
+  }
+
+  function setHtmlById(sel, html) {
+    const node = $(sel);
+    if (node) node.innerHTML = html;
+    return node;
+  }
+
+  /* 版本比较（"Python 3.12.3" / "v24.22.1" 都能吃） */
+  function versionParts(text) {
+    const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(text || ''));
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3] || 0)] : null;
+  }
+
+  function versionAtLeast(text, min) {
+    const v = versionParts(text);
+    if (!v) return null;
+    for (let i = 0; i < 3; i += 1) {
+      if (v[i] > min[i]) return true;
+      if (v[i] < min[i]) return false;
+    }
+    return true;
+  }
+
+  /** SnowLuma 的 Node 门槛：``^24.22.1 || >=26.12.1``（见 slab/installer.py NODE_REQUIRED）。 */
+  function nodeVersionOk(text) {
+    const v = versionParts(text);
+    if (!v) return null;
+    if (v[0] === 24) return versionAtLeast(text, [24, 22, 1]);
+    if (v[0] >= 26) return versionAtLeast(text, [26, 12, 1]);
+    return false;
+  }
+
+  /* 静态 HTML 里那几句 Windows 专有说法：只在确定是 Linux 时改写，
+     Windows / 未知平台保持原文（Windows 行为一个字不变）。 */
+  let platformCopyApplied = null;
+
+  /* QQ 多开形态由**后端**决定：/api/qq/summary 的 clone_mode
+     （'home' = Linux 独立 HOME 多开 / 'inject' = Windows DLL 分身）。
+     后端没给时退回平台判定；不要只看 is_windows 猜能力。 */
+  let qqCloneMode = '';
+
+  function qqHomeMode() {
+    if (qqCloneMode === 'home') return true;
+    if (qqCloneMode === 'inject') return false;
+    return isLinux();
+  }
+
+  /** 按 clone_mode 切换 QQ 卡片的多开措辞与入口（幂等，可在每次刷新后调用）。 */
+  function applyQqModeCopy() {
+    const launch = $('#qq-launch');
+    const hint = $('#qq-linux-hint');
+    const sel = $('#qq-install-select');
+    if (qqHomeMode()) {
+      if (launch) {
+        setText(launch, '独立 HOME 多开');
+        launch.title = '用独立 HOME 启动一个新的 QQ 实例（Linux 没有 DLL 注入这回事）';
+      }
+      if (sel) sel.title = '选择要多开的 QQ 安装';
+      if (hint) {
+        hint.hidden = false;
+        setText(hint, 'Linux 上没有「深度分身（DLL 注入）」：多开用独立 HOME，'
+          + '注入前需要给 node 打上 cap_sys_ptrace，并保证 ptrace_scope ≤ 2。');
+      }
+    } else {
+      if (launch) {
+        setText(launch, '隔离启动 QQ');
+        launch.title = '';
+      }
+      if (sel) sel.title = '选择要隔离启动的 QQ 安装';
+      if (hint) hint.hidden = true;
+    }
+    /* 官方 Linux QQ 安装指引：只在 home 模式且确实没检测到安装时出现 */
+    const install = $('#qq-linux-install');
+    if (install) {
+      const missing = qqHomeMode() && !qqInstalls.length;
+      install.hidden = !missing;
+      if (missing) {
+        setText(install, '未检测到官方 Linux QQ：先装官方 QQNT deb（apt install -y ./QQ_*.deb，'
+          + 'x64 用 amd64 包、arm64 用 arm64 包，默认装到 /opt/QQ），再在图形会话里扫码登录。');
+      }
+    }
+  }
+
+  function applyPlatformCopy(force) {
+    const plat = currentPlatform();
+    if (!force && platformCopyApplied === plat) return plat;
+    platformCopyApplied = plat;
+    if (plat !== PLAT.LINUX) return plat;
+
+    /* ---- 部署页 ---- */
+    setHtmlById('#deploy-silent-note',
+      '说明：所有下载/安装都在后台静默执行，<b>不会额外弹出终端窗口</b>；进度与输出都显示在下方日志里。');
+    setById('#drop-backups', '清空备份（data/backups）');
+    setById('#dep-uninstall-note',
+      '「卸载」会把目录备份到 data/backups（可回滚）；「彻底删除」直接删掉安装目录和它的历史备份，不可恢复。');
+    [['#dep-snowluma-dir', '默认：程序目录/runtime/snowluma'],
+     ['#dep-astrbot-dir', '默认：程序目录/runtime/astrbot'],
+     ['#cfg-snowluma-dir', '留空 = 程序目录/runtime/snowluma'],
+     ['#cfg-astrbot-dir', '留空 = 程序目录/runtime/astrbot']].forEach(([sel, text]) => {
+      const input = $(sel);
+      if (input) input.placeholder = text;
+    });
+    $$('[data-open-dir]').forEach((btn) => { btn.title = '在文件管理器里打开'; });
+
+    /* ---- 配置页 ---- */
+    setById('#cfg-paths-head', '想放到别的挂载点就改这里；留空用默认位置');
+    setById('#upgrade-backup-li',
+      '程序文件：被新版本覆盖，覆盖前自动备份到 data/backups/program-v…');
+
+    /* ---- 运行页 · 接入 QQ（多开形态由后端 /api/qq/summary 的 clone_mode 决定） ---- */
+    setById('#qq-step-login',
+      '用机器人账号登录 QQ 客户端：先用官方 Linux QQ（默认装在 /opt/QQ）扫码登录；'
+      + '登录后别退出、别切号，让 QQ 留在后台运行。没有图形会话（DISPLAY 为空）时扫码做不了'
+      + '（见 docs/LINUX.md 第 7 节）。');
+    setById('#qq-trouble-perm',
+      '权限不一致：控制台与 QQ 必须是同一个 Linux 用户（同一个 uid），两边都别用 sudo。');
+    setById('#qq-trouble-antivirus',
+      '注入被拒：给 node 打上 cap_sys_ptrace，并确认 ptrace_scope 不是 3（见 docs/LINUX.md 第 4 节）。');
+    applyQqModeCopy();
+
+    /* ---- 帮助弹窗 / 向导 ---- */
+    setById('#help-step-qq',
+      '登录 QQ：用机器人小号在官方 Linux QQ（默认 /opt/QQ）里扫码登录，登录后保持 QQ 在后台运行。'
+      + 'SnowLuma 不会弹二维码——它通过 ptrace 注入已登录的 QQ 进程来接管会话，所以扫码动作在 QQ 客户端里完成。');
+    setById('#help-faq-antivirus',
+      '注入失败：多半是缺 cap_sys_ptrace 或 ptrace_scope=3，见 docs/LINUX.md 第 4 节。');
+    setById('#wiz-install-note', '大约 3–10 分钟；输出都显示在下方日志里');
+    return plat;
+  }
+
+  /* ====================================================================== *
    * 2. Toast 提示
    * ====================================================================== */
   const toastHost = $('#toasts');
@@ -198,7 +397,12 @@
     try {
       res = await fetch(path, init);
     } catch (err) {
-      throw new ApiError('连不上控制台后端，请确认黑色命令行窗口没有关闭（可重新双击「一键启动.bat」）', 0, err);
+      // 后端连不上时可能还没拿到 env（不知道平台）→ 用中性说法，并把两种启动方式都写清楚
+      throw new ApiError(platCopy(
+        '连不上控制台后端，请确认黑色命令行窗口没有关闭（可重新双击「一键启动.bat」）',
+        '连不上控制台后端，请确认终端里控制台进程还在运行（可重新运行「一键启动.sh」）',
+        '连不上控制台后端，请确认控制台进程没有退出（Windows 双击「一键启动.bat」，Linux 运行「一键启动.sh」）',
+      ), 0, err);
     }
     let data = null;
     const raw = await res.text().catch(() => '');
@@ -373,6 +577,9 @@
     S.startedAt = Number(data.started_at || (Date.now() / 1000 - S.uptime));
     S.services = data.services || {};
     S.env = data.env || S.env;
+    // 平台判定来自后端字段：先记住，再按平台改写静态文案（Windows 上什么都不改）
+    rememberPlatform(data.env);
+    applyPlatformCopy();
     S.ports = data.ports || {};
     S.paths = data.paths || {};
     S.storage = data.storage || S.storage || {};
@@ -533,6 +740,22 @@
     const linkOnebot = S.link && S.link.onebot ? S.link.onebot : null;
     const multiNote = '多开 QQ 时，每个已登录账号各有一条连接；任意一条正常即算连通';
 
+    // 0) 中继模式：接进 AstrBot 的那条连接由内置中继提供，SnowLuma 的 wsClients
+    //    天生为空。直接看后端按中继上游算出来的 clients_connected，别用空列表误报。
+    if (linkOnebot && linkOnebot.clients_source === 'bridge') {
+      const up = Number(linkOnebot.clients_connected || 0) > 0;
+      return statusCard({
+        title: 'OneBot 连接',
+        badge: up ? '已连接' : '未连接',
+        cls: up ? 'ok' : 'warn',
+        tone: up ? 'ok' : 'warn',
+        value: `端口 ${port}`,
+        note: up
+          ? '中继已作为 OneBot 客户端接入 AstrBot（SnowLuma 侧不需要 wsClient）'
+          : '中继还没连上 AstrBot，去「联调」页点「修复发送链路」重新登记',
+      });
+    }
+
     // 1) 后端给了连接列表：至少一条正常 → 绿灯
     const list = onebotConnList(linkOnebot);
     if (list) {
@@ -618,13 +841,119 @@
     }
   }
 
-  function envRow(name, ok, value, hint) {
-    const ico = el('span', { class: `ico ${ok ? 'ok' : 'bad'}`, text: ok ? '✓' : '×' });
+  /* --------------------------------------------------------------- 环境自检 */
+  /* 行标题由前端持有（中英两套词条可控），数据来自后端 env.checks[]。
+     state 语义：true=通过 / false=不通过 / 'warn'=建议修 / null=未知（例如没装 getcap） */
+  const ENV_ROW_LABELS = {
+    python: 'Python（≥ 3.12，控制台与 AstrBot 都要）',
+    python3: 'python3（AstrBot 需要 ≥ 3.12）',
+    git: 'Git（克隆 AstrBot 需要）',
+    uv: 'uv（更快的 Python 包管理器，可选）',
+    node: 'Node.js（SnowLuma lite 版需要）',
+    pnpm: 'pnpm（可选）',
+    disk: '可用磁盘空间（建议 ≥ 3 GB）',
+    venv: 'python3-venv（创建虚拟环境需要）',
+    ptrace_scope: 'Yama ptrace_scope（= 3 时禁止注入）',
+    node_cap_ptrace: 'node 的 cap_sys_ptrace（注入权限）',
+    display: '图形会话（DISPLAY，扫码登录需要）',
+    uid: '与 QQ 同一个用户（uid）',
+  };
+
+  function envRow(name, state, value, hint) {
+    let tone = 'warn';
+    let mark = '?';
+    if (state === true) { tone = 'ok'; mark = '✓'; }
+    else if (state === false) { tone = 'bad'; mark = '×'; }
+    else if (state === 'warn') { tone = 'warn'; mark = '!'; }
     return el('li', { title: hint || '' }, [
-      ico,
+      el('span', { class: `ico ${tone}`, text: mark }),
       el('span', { class: 'name', text: name }),
       el('span', { class: 'val', text: value || '' }),
     ]);
+  }
+
+  /* 修复指引：后端 env.checks[i].fix 是一条可直接复制的命令 */
+  function envFixRow(fix) {
+    return el('li', { class: 'env-fix' }, [
+      el('span', { class: 'ico warn', text: '!' }),
+      el('span', { class: 'name', text: '修复：' }),
+      el('code', { class: 'val', text: String(fix) }),
+    ]);
+  }
+
+  function appendEnvCheck(list, row) {
+    if (!row || typeof row !== 'object') return;
+    const key = String(row.key || '');
+    /* 后端的约定：ok=null 表示「未知」（例如没装 getcap），只算建议；
+       ok=false 但 level=warn 的项（例如 node，只有 lite 版才需要）也不能显示成红色错误。 */
+    const soft = row.level === 'warn';
+    let state = null;
+    if (row.ok === true) state = true;
+    else if (row.ok === false) state = soft ? 'warn' : false;
+    else if (soft) state = 'warn';
+    const raw = row.value === undefined || row.value === null ? '' : String(row.value);
+    list.append(envRow(
+      ENV_ROW_LABELS[key] || String(row.label || key || ''),
+      state,
+      // 后端会带「当前 3.12.3」这类前缀；前端统一去掉，避免英文界面里夹中文
+      raw.replace(/^当前\s*/, '') || (state === false ? '未检测到' : ''),
+      row.hint ? String(row.hint) : '',
+    ));
+    const fix = String(row.fix || '').trim();
+    if (fix && state !== true) list.append(envFixRow(fix));
+  }
+
+  /* 后端还没给 env.checks[] 时的兜底（Linux 专属项自己推一遍；推不出就显示未知） */
+  function linuxEnvFallback(env) {
+    const lx = env.linux || {};
+    const tools = env.tools || {};
+    const rows = [];
+
+    const pyVer = lx.python_version || (tools.python && tools.python.version) || '';
+    const pyOk = typeof lx.python_ok === 'boolean' ? lx.python_ok : versionAtLeast(pyVer, [3, 12, 0]);
+    rows.push({
+      key: 'python3', ok: pyOk, value: pyVer || '未知',
+      fix: 'sudo apt install -y python3.12 python3.12-venv（或先装 uv 再 uv python install 3.12）',
+    });
+
+    const venvOk = typeof lx.venv_ok === 'boolean' ? lx.venv_ok : null;
+    rows.push({
+      key: 'venv', ok: venvOk, value: venvOk === false ? '不可用' : (venvOk === true ? '可用' : '未知'),
+      fix: 'sudo apt install -y python3-venv',
+    });
+
+    const scope = Number(lx.ptrace_scope);
+    const scopeKnown = Number.isFinite(scope);
+    rows.push({
+      key: 'ptrace_scope',
+      ok: scopeKnown ? scope <= 2 : null,
+      value: scopeKnown ? String(scope) : '未知',
+      fix: 'sudo sysctl -w kernel.yama.ptrace_scope=1（永久：写入 /etc/sysctl.d/99-snowluma.conf）',
+    });
+
+    const cap = lx.node_cap_ptrace;
+    rows.push({
+      key: 'node_cap_ptrace',
+      ok: typeof cap === 'boolean' ? cap : null,
+      value: cap === true ? 'cap_sys_ptrace=ep' : (cap === false ? '未设置' : '未知（缺 libcap2-bin 时无法确认）'),
+      fix: 'sudo setcap cap_sys_ptrace=ep <SnowLuma 安装目录>/node（用 readlink -f 取真实路径）',
+    });
+
+    const nodeVer = lx.node_version || (tools.node && tools.node.version) || '';
+    const nodeOk = typeof lx.node_ok === 'boolean' ? lx.node_ok : nodeVersionOk(nodeVer);
+    rows.push({
+      key: 'node', ok: nodeOk, value: nodeVer || '未知',
+      fix: '改用 full 版（自带 node），或装 Node ^24.22.1 / >=26.12.1',
+    });
+
+    const display = String(lx.display || '');
+    const wayland = String(lx.wayland || '');
+    rows.push({
+      key: 'display', ok: (display || wayland) ? true : 'warn',
+      value: display || wayland || '未设置',
+      fix: '在桌面会话里启动控制台；无头服务器用 Xvfb + VNC（见 docs/LINUX.md 第 7 节）',
+    });
+    return rows;
   }
 
   function renderEnv() {
@@ -637,6 +966,7 @@
       return;
     }
     const tools = env.tools || {};
+    const checks = Array.isArray(env.checks) && env.checks.length ? env.checks : null;
     const order = [
       ['python', 'Python（控制台自身）'],
       ['git', 'Git（克隆 AstrBot 需要）'],
@@ -644,19 +974,41 @@
       ['node', 'Node.js（SnowLuma lite 版需要）'],
       ['pnpm', 'pnpm（可选）'],
     ];
-    for (const [key, label] of order) {
-      const info = tools[key] || {};
-      const ver = info.version && info.version.indexOf('<失败') === 0 ? info.version : (info.version || '');
-      list.append(envRow(label, !!info.ok, info.ok ? (ver || '已安装') : '未检测到', info.path || ''));
+    const seen = new Set();
+
+    if (checks) {
+      /* 后端「整包」模式：顺序即展示顺序，Linux 专属项（ptrace/setcap/DISPLAY/venv）也在里面 */
+      checks.forEach((row) => {
+        if (row && typeof row === 'object' && row.key) seen.add(String(row.key));
+        appendEnvCheck(list, row);
+      });
+      /* 补漏：后端 checks 没覆盖到的工具（例如 uv / pnpm）仍用 tools 显示一行 */
+      for (const [key, label] of order) {
+        if (seen.has(key)) continue;
+        const info = tools[key] || {};
+        const ver = info.version && info.version.indexOf('<失败') === 0 ? info.version : (info.version || '');
+        list.append(envRow(label, !!info.ok, info.ok ? (ver || '已安装') : '未检测到', info.path || ''));
+      }
+    } else {
+      for (const [key, label] of order) {
+        const info = tools[key] || {};
+        const ver = info.version && info.version.indexOf('<失败') === 0 ? info.version : (info.version || '');
+        list.append(envRow(label, !!info.ok, info.ok ? (ver || '已安装') : '未检测到', info.path || ''));
+      }
+      if (isLinux()) linuxEnvFallback(env).forEach((row) => appendEnvCheck(list, row));
     }
-    const free = Number(env.free_space_gb);
-    const freeOk = Number.isFinite(free) ? free >= 3 : false;
-    list.append(envRow(
-      '磁盘剩余空间（建议 ≥ 3 GB）',
-      freeOk,
-      Number.isFinite(free) && free >= 0 ? `${free} GB` : '未知',
-      '安装两个项目约占用 1–3 GB',
-    ));
+
+    /* 磁盘：后端 checks 里已有「disk」就不再重复一行 */
+    if (!seen.has('disk')) {
+      const free = Number(env.free_space_gb);
+      const freeOk = Number.isFinite(free) ? free >= 3 : false;
+      list.append(envRow(
+        '磁盘剩余空间（建议 ≥ 3 GB）',
+        freeOk,
+        Number.isFinite(free) && free >= 0 ? `${free} GB` : '未知',
+        '安装两个项目约占用 1–3 GB',
+      ));
+    }
     const installed = env.installed || {};
     list.append(envRow('SnowLuma 已安装', !!installed.snowluma, installed.snowluma ? '是' : '否'));
     list.append(envRow('AstrBot 已安装', !!installed.astrbot, installed.astrbot ? '是' : '否'));
@@ -881,7 +1233,11 @@
           class: 'btn sm',
           type: 'button',
           text: '复制路径',
-          onclick: () => copyText(path, '路径已复制，可粘贴到资源管理器地址栏'),
+          onclick: () => copyText(path, platCopy(
+            '路径已复制，可粘贴到资源管理器地址栏',
+            '路径已复制，可粘贴到文件管理器地址栏',
+            '路径已复制',
+          )),
         });
         if (!path) btn.disabled = true;
         table.append(el('tr', {}, [
@@ -894,12 +1250,25 @@
     }
   }
 
+  /* 存储规划里的「盘」：Windows 是盘符（C/D…），Linux 是挂载点（/ 、/home、/opt…） */
+  function driveLabel(drive) {
+    if (!drive || typeof drive !== 'object') return '';
+    const name = drive.mount || drive.mountpoint || drive.path || drive.letter
+      || drive.drive || drive.name || drive.device || '';
+    return String(name || '');
+  }
+
   function renderStorage() {
     const st = S.storage || {};
     const note = $('#storage-note');
     if (note) {
       const drives = (st.drives || [])
-        .map((d) => `${d.letter}: ${d.free_gb} GB 可用`)
+        .map((d) => {
+          const label = driveLabel(d);
+          const free = d.free_gb === undefined ? '' : ` ${d.free_gb} GB 可用`;
+          return `${label}${free}`;
+        })
+        .filter((text) => text.trim())
         .join(' · ');
       const reason = st.reason || (st.base ? `放在 ${st.base}` : '');
       note.textContent = reason ? `存储规划：${reason}${drives ? `（${drives}）` : ''}` : '';
@@ -914,7 +1283,7 @@
       [['#dep-snowluma-dir', 'snowluma'], ['#dep-astrbot-dir', 'astrbot'],
        ['#cfg-snowluma-dir', 'snowluma'], ['#cfg-astrbot-dir', 'astrbot']].forEach(([sel, name]) => {
         const input = $(sel);
-        if (input && !input.value) input.placeholder = `默认：${rt}\\${name}`;
+        if (input && !input.value) input.placeholder = `默认：${pathJoin(rt, name)}`;
       });
     }
   }
@@ -1136,8 +1505,14 @@
     const hint = $('#dep-snowluma-edition-hint');
     if (!sel || !hint) return;
     hint.textContent = sel.value === 'lite'
-      ? 'lite 版体积更小，但要求本机已安装 Node.js ≥ 24.22.1，否则启动会失败。'
-      : 'full 版自带 node.exe，不用自己装 Node，小白首选；lite 版体积小，但要求本机已有 Node。';
+      ? platCopy(
+        'lite 版体积更小，但要求本机已安装 Node.js ≥ 24.22.1，否则启动会失败。',
+        'lite 版体积更小，但要求本机 Node 满足 ^24.22.1 || >=26.12.1（发行版自带的 node 基本都不满足），否则启动会失败。',
+      )
+      : platCopy(
+        'full 版自带 node.exe，不用自己装 Node，小白首选；lite 版体积小，但要求本机已有 Node。',
+        'full 版自带 node，不用自己装 Node，小白首选（发行版仓库里的 node 版本普遍不够）；lite 版体积小，但要求本机 Node 满足 ^24.22.1 || >=26.12.1。',
+      );
   }
 
   async function generateToken(btn) {
@@ -1407,7 +1782,9 @@
     } catch (err) {
       if (note) {
         note.hidden = false;
-        note.textContent = `无法打开系统目录选择框（${err.message || err}）。可以直接在输入框里粘贴路径，例如 D:\\bots\\snowluma`;
+        // 浏览器版在 Linux 上没有 zenity/kdialog 时后端返回 501，这里给手输路径的例子
+        const example = platCopy('D:\\bots\\snowluma', '/opt/bots/snowluma', '<可写目录>');
+        note.textContent = `无法打开系统目录选择框（${err.message || err}）。可以直接在输入框里粘贴路径，例如 ${example}`;
       }
       fail(err, '打开目录选择框失败');
     }
@@ -2433,6 +2810,10 @@
         });
       }
     }
+    /* 多开形态以后端为准：clone_mode = 'home'（Linux 独立 HOME）/ 'inject'（Windows DLL 分身）。
+       兼容旧后端（没有该字段）时 applyQqModeCopy 会退回平台判定。 */
+    qqCloneMode = String((data && data.clone_mode) || '');
+    applyQqModeCopy();
     const modeHint = $('#qq-mode-hint');
     const mode = (S.config && S.config.snowluma && S.config.snowluma.hook_mode) || 'manual';
     if (modeHint) {
@@ -2490,7 +2871,20 @@
     const sel = $('#qq-install-select');
     const source = sel ? sel.value : '';
     await withBusy(btn, async () => {
-      // 优先用"深度分身"（注入 sandbox DLL：互斥体改名 + 已知文件夹重定向），
+      /* 独立 HOME 模式（clone_mode='home'，Linux）：没有「深度分身」（DLL 注入），多开靠独立 HOME。
+         QQ 的单实例锁在 $HOME/.config/QQ/SingletonLock，换 HOME 才能起第二个实例。 */
+      if (qqHomeMode()) {
+        try {
+          const res = await api('/api/qq/launch-isolated', { method: 'POST', body: { source_exe: source } });
+          toast('已用独立 HOME 启动多开 QQ', 'ok', res.note || '在窗口里登录小号，再回来点「刷新进程 → 用这个」');
+          await loadQq();
+          scheduleState(1000);
+        } catch (err) {
+          fail(err, '独立 HOME 多开失败');
+        }
+        return;
+      }
+      // Windows：优先用"深度分身"（注入 sandbox DLL：互斥体改名 + 已知文件夹重定向），
       // 组件缺失时退化为只改环境变量的轻量隔离。
       try {
         const status = await api('/api/qq/clone/status');
@@ -2805,6 +3199,8 @@
     setConn('connecting');
     go(currentPage(), { replace: true });
     renderSkeleton();
+    // 上次会话记住的平台（localStorage）先把文案切对，state 回来后再校准一次
+    applyPlatformCopy();
     // 先连实时通道，再取状态快照：环境自检较慢时页面也不会一片空白
     connectSSE();
     startPolling();

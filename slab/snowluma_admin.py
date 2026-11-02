@@ -24,7 +24,7 @@ import re
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -485,6 +485,81 @@ def merge_ws_server(config: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, 
     servers.append(server)
     merged["networks"]["wsServers"] = servers
     return merged
+
+
+# --------------------------------------------------------------------------- #
+# native 直连（wsClient）的识别与清理
+# --------------------------------------------------------------------------- #
+def direct_client_url(cfg: AppConfig) -> str:
+    """native 模式那条「SnowLuma → AstrBot」直连的 URL（已去掉 query）。"""
+
+    return _url_without_query(str(ws_client_entry(cfg).get("url", "")))
+
+
+def is_direct_client(
+    item: Any,
+    cfg: AppConfig,
+    *,
+    names: Sequence[str] = (DEFAULT_CLIENT_NAME,),
+) -> bool:
+    """判断某条 wsClient 是不是「直连 AstrBot 反向 WS」的那条。
+
+    命中规则：名字是我们写入的默认名，**或** URL 指向本控制台配置的 AstrBot
+    反向 WS（用户手改过名字也算，否则改名后就会漏清理并重新出现双通道）。
+    """
+
+    if not isinstance(item, dict):
+        return False
+    wanted = {str(n).strip() for n in names if str(n).strip()}
+    if str(item.get("name") or "").strip() in wanted:
+        return True
+    return _url_without_query(str(item.get("url", ""))) == direct_client_url(cfg)
+
+
+def _tag_removed(source: str, removed: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [{"source": source, **dict(item)} for item in removed]
+
+
+def strip_direct_clients(
+    config: Dict[str, Any],
+    cfg: AppConfig,
+    *,
+    names: Sequence[str] = (DEFAULT_CLIENT_NAME,),
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """删掉指向 AstrBot 反向 WS 的 wsClient，返回 ``(新配置, 被删条目)``。
+
+    为什么必须删：中继（bridge）模式下 SnowLuma 的 wsServer（默认 3001）把事件
+    交给内置中继、中继再转给 AstrBot；如果 native 时代写入的 wsClient
+    （``astrbot`` → ``ws://…:6199/ws``）还留着，SnowLuma 会把**同一条 QQ 消息**
+    也直推一次 AstrBot —— AstrBot 处理两遍、回两遍，用户看到的就是
+    「发一条消息，机器人连着回两条」。
+
+    只动我们自己那条直连，用户其它 wsClient 原样保留（顺序不变）。
+    """
+
+    data = json.loads(json.dumps(config or {}, ensure_ascii=False))
+    networks = data.get("networks")
+    if not isinstance(networks, dict):
+        return data, []
+    clients = networks.get("wsClients")
+    if not isinstance(clients, list):
+        return data, []
+
+    kept: List[Dict[str, Any]] = []
+    removed: List[Dict[str, Any]] = []
+    for item in clients:
+        if is_direct_client(item, cfg, names=names):
+            removed.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "url": str(item.get("url") or ""),
+                    "enabled": bool(item.get("enabled", True)),
+                }
+            )
+            continue
+        kept.append(item)
+    networks["wsClients"] = kept
+    return data, removed
 
 
 # --------------------------------------------------------------------------- #
@@ -1211,6 +1286,9 @@ async def probe(
     base = home_dir(cfg, home)
     cdir = base / CONFIG_DIRNAME
     deployed = base.is_dir()
+    #: 中继模式下 SnowLuma 只提供 wsServer（3001），接进 AstrBot 的是内置中继；
+    #: 此时「SnowLuma 里没有 wsClient」是**正确状态**，不能提示用户去写入直连。
+    bridge_mode = str(cfg.link.mode) == "bridge"
     template_path = cdir / TEMPLATE_FILENAME
     template = read_json(template_path) if template_path.exists() else {}
     entry = ws_client_entry(cfg)
@@ -1222,12 +1300,17 @@ async def probe(
 
     per_uin: List[Dict[str, Any]] = []
     our_names = {DEFAULT_CLIENT_NAME}
+    stale_direct: List[Dict[str, Any]] = []
     for uin in accounts_from_files(base):
         data = read_json(cdir / f"onebot_{uin}.json")
         clients = [item for item in ((data.get("networks") or {}).get("wsClients") or []) if isinstance(item, dict)]
         ours = [
             item for item in clients if _url_without_query(str(item.get("url", ""))) == wanted_url
         ]
+        direct = [item for item in clients if is_direct_client(item, cfg)]
+        for item in direct:
+            stale_direct.append({"file": f"onebot_{uin}.json", "name": str(item.get("name") or ""),
+                                 "url": str(item.get("url") or "")})
         for item in ours:
             if item.get("name"):
                 our_names.add(str(item["name"]))
@@ -1238,12 +1321,17 @@ async def probe(
                 "has_client": bool(ours),
                 "client_name": str((ours[0].get("name") if ours else "") or ""),
                 "clients": len(clients),
+                "has_direct": bool(direct),
             }
         )
     for item in ((template.get("networks") or {}).get("wsClients") or []):
         if isinstance(item, dict) and _url_without_query(str(item.get("url", ""))) == wanted_url:
             if item.get("name"):
                 our_names.add(str(item["name"]))
+    for item in ((template.get("networks") or {}).get("wsClients") or []):
+        if is_direct_client(item, cfg, names=tuple(our_names)):
+            stale_direct.append({"file": TEMPLATE_FILENAME, "name": str(item.get("name") or ""),
+                                 "url": str(item.get("url") or "")})
 
     webui_port = int(cfg.snowluma.webui_port)
     reachable = await _port_open_async(webui_port, timeout=min(0.6, timeout))
@@ -1337,17 +1425,37 @@ async def probe(
         suggestions.append("确认 AstrBot 已启动（WebUI 端口可访问）且 aiocqhttp 反向 WS 正在监听")
         suggestions.append("确认 SnowLuma 与 AstrBot 的 token 一致（重新执行「写入配置」）")
     elif not clients:
-        state = "config_missing"
-        hint = "SnowLuma 在运行，但没有我们写入的反向 WS 连接（可能尚未写入配置，或 QQ 会话未建立）"
-        suggestions.append("点击「写入配置」把 wsClient 注入 SnowLuma")
+        if bridge_mode:
+            state = "relay"
+            hint = (
+                "中继模式：SnowLuma 只用 wsServer 对 3001 提供 OneBot，接进 AstrBot 的是内置中继；"
+                "SnowLuma 侧没有 wsClient 是正常的"
+            )
+        else:
+            state = "config_missing"
+            hint = "SnowLuma 在运行，但没有我们写入的反向 WS 连接（可能尚未写入配置，或 QQ 会话未建立）"
+            suggestions.append("点击「写入配置」把 wsClient 注入 SnowLuma")
     else:  # pragma: no cover - 理论不可达
         state = "unknown"
         hint = "状态未知"
 
     if webui.get("error"):
-        suggestions.insert(0, f"SnowLuma 面板登录/查询失败：{webui['error']}")
-    if deployed and not template_has_client:
+        # 刚点完「一键启动全部」时 SnowLuma 还在预热（QQ hook 要几秒到几十秒），
+        # 这时候面板登录失败是正常的，别让用户以为密码错了去「重置密码」。
+        started = float(process.get("started_at") or 0.0)
+        warming = bool(started) and (time.time() - started) < 30.0
+        if warming and not clients:
+            suggestions.insert(0, "SnowLuma 刚启动，面板还没就绪（约 10~30 秒），稍后点「刷新」即可")
+        else:
+            suggestions.insert(0, f"SnowLuma 面板登录/查询失败：{webui['error']}")
+    if deployed and not template_has_client and not bridge_mode:
         suggestions.append("模板 config/onebot.json 里还没有 astrbot 连接，建议执行「写入配置」")
+    if str(cfg.link.mode) == "bridge" and stale_direct:
+        suggestions.insert(
+            0,
+            "SnowLuma 里还留着 native 时代的直连适配器（wsClient → AstrBot 反向 WS）：它和内置中继会把"
+            "同一条消息各投递一次 → 机器人每条都回两遍。点「写入联动配置」（或「修复发送链路」）会自动清理。",
+        )
     suggestions.extend(mismatch_warnings)
 
     # 进程没跑时，日志里的历史"connected"只能作为历史证据（log 字段），
@@ -1371,6 +1479,7 @@ async def probe(
                      "has_client": template_has_client},
         "per_uin": per_uin,
         "clients": clients,
+        "direct_clients": stale_direct,
         "connected": connected_now,
         "warnings": mismatch_warnings,
         "target_url": entry["url"],
@@ -1562,27 +1671,38 @@ async def apply_relay(
         }
 
     entry = ws_server_entry(cfg)
+    removed_all: List[Dict[str, Any]] = []
     template_path = cdir / TEMPLATE_FILENAME
     template = read_json(template_path) if template_path.exists() else minimal_onebot_config()
-    merged = merge_ws_server(template, entry)
+    merged, removed = strip_direct_clients(merge_ws_server(template, entry), cfg)
     info = _write_onebot_file(template_path, merged, mode=None)
     files.append(info["path"])
-    steps.append({"step": "template", "ok": True, "detail": f"已写入 wsServer 到 {info['path']}"})
+    removed_all.extend(_tag_removed(info["path"], removed))
+    steps.append(
+        {
+            "step": "template",
+            "ok": True,
+            "detail": f"已写入 wsServer 到 {info['path']}" + _removed_hint(len(removed)),
+        }
+    )
 
     per_uin: List[Dict[str, Any]] = []
     for uin in accounts_from_files(base):
         path = cdir / f"onebot_{uin}.json"
         current = read_json(path)
-        merged_uin = merge_ws_server(current, entry)
+        merged_uin, removed_uin = strip_direct_clients(merge_ws_server(current, entry), cfg)
+        removed_all.extend(_tag_removed(str(path), removed_uin))
         mode = str(current.get("mode") or "snapshot")
         info = _write_onebot_file(path, merged_uin, mode=mode)
         files.append(info["path"])
-        per_uin.append({"uin": uin, "path": info["path"], "mode": mode})
+        per_uin.append({"uin": uin, "path": info["path"], "mode": mode,
+                        "removed_direct": len(removed_uin)})
     steps.append(
         {
             "step": "per_uin",
             "ok": True,
-            "detail": f"已覆盖 {len(per_uin)} 个账号配置" if per_uin else "没有已存在的账号配置（仅写模板）",
+            "detail": (f"已覆盖 {len(per_uin)} 个账号配置" if per_uin else "没有已存在的账号配置（仅写模板）")
+            + _removed_hint(sum(item["removed_direct"] for item in per_uin)),
         }
     )
 
@@ -1596,7 +1716,9 @@ async def apply_relay(
             for uin in accounts_from_files(base):
                 try:
                     current = await api.get_config(uin)
-                    payload = await api.save_config(uin, merge_ws_server(current, entry))
+                    stripped, removed_hot = strip_direct_clients(merge_ws_server(current, entry), cfg)
+                    removed_all.extend(_tag_removed(f"webui:{uin}", removed_hot))
+                    payload = await api.save_config(uin, stripped)
                     hot_result["applied"].append({"uin": uin, "applied": payload.get("applied")})
                 except SnowLumaApiError as exc:
                     hot_result["error"] = str(exc)
@@ -1614,9 +1736,95 @@ async def apply_relay(
         "entry": entry,
         "relay_url": relay_ws_url(cfg),
         "relay_token": relay_token(cfg),
+        "removed_direct_clients": removed_all,
         "hot": hot_result,
         "restart_required": not hot_result["applied"],
     }
+
+
+def _removed_hint(count: int) -> str:
+    """把「清理了几条 native 直连」翻译成用户能看懂的一句话（0 条时为空串）。"""
+
+    if count <= 0:
+        return ""
+    return f"，并清理了 {count} 条 native 直连（不改掉它，同一条消息会被投递两次、机器人回两遍）"
+
+
+async def ensure_single_channel(
+    cfg: AppConfig,
+    *,
+    home: Optional[Path] = None,
+    hot: bool = True,
+    timeout: float = 4.0,
+) -> Dict[str, Any]:
+    """中继模式自愈：清掉 SnowLuma 里残留的 native 直连适配器（幂等）。
+
+    老用户从 native 升级到中继后，``config/onebot*.json`` 里往往还留着
+    ``astrbot`` 那条直连；只要它还在，SnowLuma 就会把每条 QQ 消息**同时**
+    推给直连和中继，AstrBot 于是回两条。启动中继前调用这里，能找到就清掉
+    （写文件 + 尽量热重载），找不到就什么都不做。
+
+    Returns:
+        ``{"ok", "changed", "files", "removed", "hot", "detail", "restart_required"}``
+    """
+
+    base = home_dir(cfg, home)
+    cdir = base / CONFIG_DIRNAME
+    result: Dict[str, Any] = {
+        "ok": True, "changed": False, "files": [], "removed": [], "hot": {},
+        "detail": "", "restart_required": False,
+    }
+    if not base.is_dir():
+        return {**result, "ok": False, "detail": f"SnowLuma 安装目录不存在：{base}"}
+
+    uins = accounts_from_files(base)
+    targets = [cdir / TEMPLATE_FILENAME] + [cdir / f"onebot_{uin}.json" for uin in uins]
+    for path in targets:
+        if not path.is_file():
+            continue
+        current = read_json(path)
+        stripped, removed = strip_direct_clients(current, cfg)
+        if not removed:
+            continue
+        mode = None if path.name == TEMPLATE_FILENAME else str(current.get("mode") or "snapshot")
+        _write_onebot_file(path, stripped, mode=mode)
+        result["changed"] = True
+        result["files"].append(str(path))
+        result["removed"].extend(_tag_removed(str(path), removed))
+
+    if not result["changed"]:
+        result["detail"] = "没有残留的 native 直连（同一条消息只会投递一次）"
+        return result
+
+    hot_result: Dict[str, Any] = {"attempted": False, "applied": [], "error": ""}
+    creds = webui_credentials(cfg)
+    if hot and creds["password"] and uins:
+        api = SnowLumaWebUI(webui_url(cfg), password=creds["password"], timeout=timeout)
+        try:
+            await api.login()
+            hot_result["attempted"] = True
+            for uin in uins:
+                try:
+                    current = await api.get_config(uin)
+                    stripped, _ = strip_direct_clients(current, cfg)
+                    payload = await api.save_config(uin, stripped)
+                    hot_result["applied"].append({"uin": uin, "applied": payload.get("applied")})
+                except SnowLumaApiError as exc:
+                    hot_result["error"] = str(exc)
+        except SnowLumaApiError as exc:
+            hot_result["error"] = str(exc)
+        finally:
+            await api.close()
+
+    result["hot"] = hot_result
+    applied = bool(hot_result.get("applied"))
+    result["restart_required"] = not applied
+    result["detail"] = (
+        f"已清理 {len(result['removed'])} 条 native 直连适配器（同一条消息不再被投递两次）"
+        + ("，并已热重载 SnowLuma" if applied else "，重启 SnowLuma 后生效")
+    )
+    return result
+
 
 
 async def apply_webui(cfg: AppConfig, *, home: Optional[Path] = None) -> Dict[str, Any]:

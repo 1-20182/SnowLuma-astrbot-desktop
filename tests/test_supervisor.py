@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 
 from slab.config import AppConfig
 from slab.supervisor import ServiceDef, Supervisor, port_open
@@ -120,3 +121,39 @@ async def test_state_reports_exited_process():
     st = sup.state("quick")
     assert st.exit_code == 0
     assert st.pid is None
+
+
+@pytest.mark.asyncio
+async def test_start_all_waits_until_bridge_connects(monkeypatch):
+    """「一键启动全部」要等中继真的连上 AstrBot/SnowLuma 才返回，界面才不用手动刷新。"""
+
+    import slab.bridge as bridge_mod
+
+    sup = Supervisor()
+    stop_evt = asyncio.Event()
+
+    async def _worker():
+        await stop_evt.wait()
+
+    sup.register(ServiceDef(name="bridge", display="中继", kind="task", task_factory=_worker))
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "bridge"
+
+    stub = SimpleNamespace(
+        upstream=SimpleNamespace(connected=False),
+        downstream=SimpleNamespace(connected=False),
+    )
+    monkeypatch.setattr(bridge_mod, "_bridge", stub, raising=False)
+
+    async def _connect_later():
+        await asyncio.sleep(0.5)
+        stub.upstream.connected = True
+        stub.downstream.connected = True
+
+    connector = asyncio.create_task(_connect_later())
+    result = await sup.start_all(cfg, wait_ready=10)
+    await connector
+    assert result["bridge_wait"] == "connected"
+    await sup.stop("bridge")
+    stop_evt.set()

@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from slab import installer, paths
+from slab import installer, paths, plat
 from slab.config import AppConfig
 from slab.supervisor import supervisor
 
@@ -45,12 +45,16 @@ def build_snowluma_zip(
     target: str | None = None,
     with_node: bool = True,
 ) -> bytes:
-    """在内存里造一个「和官方发行包结构一致」的小 zip。"""
+    """在内存里造一个「和官方发行包结构一致」的小 zip。
+
+    注意 node 的文件名要按平台来（Windows ``node.exe``，Linux ``node``），
+    否则解出来的包在 Linux 上会被判定成 lite 版。
+    """
 
     buffer = io.BytesIO()
     files: dict[str, bytes] = {
         "index.mjs": b"// fake snowluma entry\n",
-        "launcher.bat": b"node ./index.mjs\n",
+        "launcher.sh": b"#!/bin/sh\nexec ./node ./index.mjs\n",
         "check-node-version.cjs": b"'use strict';\n",
         "EULA.md": b"# EULA\n",
         "PRIVACY.md": b"# Privacy\n",
@@ -62,7 +66,7 @@ def build_snowluma_zip(
         ).encode(),
     }
     if with_node:
-        files["node.exe"] = b"MZ-fake-node-binary"
+        files[plat.node_bin_name()] = b"MZ-fake-node-binary"
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in files.items():
             zf.writestr(name, data)
@@ -406,7 +410,7 @@ def test_verify_and_extract_zip(tmp_path):
     root = installer.extract_archive(archive, tmp_path / "out")
     assert (root / "index.mjs").is_file()
     assert (root / "client" / "index.html").is_file()
-    assert (root / "node.exe").is_file()
+    assert (root / plat.node_bin_name()).is_file()
 
 
 def test_extract_tar_gz(tmp_path):
@@ -537,7 +541,7 @@ def test_deploy_snowluma_offline_is_idempotent(sandbox):
     assert first["installed"] is True and first["skipped"] is False
     assert first["version"] == "2.2.1" and first["edition"] == "full"
     assert first["dir"] == str(home)
-    assert (home / "index.mjs").is_file() and (home / "node.exe").is_file()
+    assert (home / "index.mjs").is_file() and (home / plat.node_bin_name()).is_file()
     runtime_json = json.loads((home / "config" / "runtime.json").read_text("utf-8"))
     assert runtime_json["webuiPort"] == cfg.snowluma.webui_port
     assert runtime_json["webuiHost"] == "127.0.0.1"
@@ -704,7 +708,8 @@ def test_install_dir_relative_rejected(sandbox):
 
 def test_install_dir_system_folder_rejected(sandbox):
     cfg: AppConfig = sandbox["cfg"]
-    cfg.astrbot.install_dir = "C:/Windows/System32/astrbot"
+    # 系统目录按平台取：Windows 是 Windows\System32，Linux 是 /usr/bin
+    cfg.astrbot.install_dir = "C:/Windows/System32/astrbot" if plat.IS_WINDOWS else "/usr/bin/astrbot"
     with pytest.raises(installer.DeployError) as exc:
         installer.astrbot_dir(cfg)
     assert "系统目录" in str(exc.value)
@@ -927,7 +932,7 @@ def _fake_snowluma_install(sandbox, with_node: bool = True) -> Path:
     home.mkdir(parents=True, exist_ok=True)
     (home / "index.mjs").write_text("// entry\n", "utf-8")
     if with_node:
-        (home / "node.exe").write_text("MZ", "utf-8")
+        (home / plat.node_bin_name()).write_text("MZ", "utf-8")
     return home
 
 
@@ -937,7 +942,7 @@ def test_snowluma_service_def_full(sandbox):
     cfg.snowluma.edition = "full"
     definition = installer.snowluma_service_def()
     assert definition.name == "snowluma"
-    assert definition.argv(cfg) == [str(home / "node.exe"), "index.mjs"]
+    assert definition.argv(cfg) == [str(home / plat.node_bin_name()), "index.mjs"]
     assert definition.cwd(cfg) == home
     assert "listening" in definition.ready_regex
     # 端口可能被自动换掉，所以不绑定 ready_port
@@ -961,7 +966,8 @@ def test_snowluma_service_def_full_missing_node_raises(sandbox):
     cfg.snowluma.edition = "full"
     with pytest.raises(installer.DeployError) as exc:
         installer.snowluma_service_def().argv(cfg)
-    assert "node.exe" in str(exc.value) and "下一步" in str(exc.value)
+    # 报错里要出现「本平台的那个 node 文件名」：Windows node.exe / Linux node
+    assert plat.node_bin_name() in str(exc.value) and "下一步" in str(exc.value)
 
 
 def test_snowluma_service_def_not_installed_raises(sandbox):

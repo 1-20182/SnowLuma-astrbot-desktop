@@ -301,7 +301,15 @@ def test_selftest_and_repair_routes_exist():
 
 
 def test_repair_restarts_snowluma_and_reports(monkeypatch):
+    """native 模式：接进 AstrBot 的是 SnowLuma 自己那条连接 → 重启 SnowLuma。"""
+
+    from slab.config import AppConfig
     from slab.server import routes_link
+
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "native"
+    monkeypatch.setattr(routes_link, "get_config", lambda: cfg)
 
     calls = []
 
@@ -318,7 +326,6 @@ def test_repair_restarts_snowluma_and_reports(monkeypatch):
     async def fake_status(force=False):  # noqa: ANN001
         return {"onebot": {"clients_connected": 1, "self_id": "3985934176"}}
 
-    monkeypatch.setattr(routes_link, "_sup_mod_supervisor", FakeSup(), raising=False)
     import slab.supervisor as sup_mod
 
     monkeypatch.setattr(sup_mod, "supervisor", FakeSup())
@@ -330,7 +337,47 @@ def test_repair_restarts_snowluma_and_reports(monkeypatch):
     assert [c[0] for c in calls] == ["stop", "start"]
     names = [s["name"] for s in body["steps"]]
     assert any("SnowLuma" in n for n in names)
-    assert any("中继" in n or "SnowLuma" in n for n in names)
+
+
+def test_repair_restarts_bridge_after_cleaning_direct_client(monkeypatch):
+    """bridge 模式：接进 AstrBot 的是中继 → 清残留直连并重启中继重新登记 bot。"""
+
+    from slab.config import AppConfig
+    from slab.server import routes_link
+
+    cfg = AppConfig()
+    cfg.normalise()
+    cfg.link.mode = "bridge"
+    monkeypatch.setattr(routes_link, "get_config", lambda: cfg)
+
+    calls = []
+
+    class FakeSup:
+        async def stop(self, name): calls.append(("stop", name))
+        async def start(self, name, cfg=None): calls.append(("start", name))
+        async def restart(self, name, cfg=None): calls.append(("restart", name))
+
+    async def fake_reregister(_cfg=None, **_kwargs):
+        calls.append(("reregister", "bridge"))
+        return {"ok": True, "detail": "中继已重新接入 AstrBot", "self_id": "3985934176"}
+
+    async def fake_heal(cfg, *, home=None, hot=True, timeout=4.0):  # noqa: ANN001
+        return {"ok": True, "changed": True, "files": ["x"], "removed": [{"name": "astrbot"}],
+                "detail": "已清理 1 条 native 直连适配器"}
+
+    import slab.supervisor as sup_mod
+
+    monkeypatch.setattr(sup_mod, "supervisor", FakeSup())
+    monkeypatch.setattr(routes_link.bridge, "reregister", fake_reregister)
+    monkeypatch.setattr(routes_link.snowluma_admin, "ensure_single_channel", fake_heal)
+
+    with TestClient(create_app()) as c:
+        body = c.post("/api/link/repair?send_test=false").json()
+    assert ("reregister", "bridge") in calls
+    assert not [n for kind, n in calls if kind in ("stop", "start") and n == "snowluma"]
+    names = [s["name"] for s in body["steps"]]
+    assert "重启中继（重新登记可发送的 bot）" in names
+    assert "清理残留直连适配器" in names
 
 
 def test_selftest_ui_buttons():
